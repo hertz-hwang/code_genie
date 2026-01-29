@@ -17,31 +17,30 @@ mod config {
 
     // [模拟退火 - 核心参数]
     // 线程数：建议设为 CPU 核心数。每个线程都会跑一遍完整的 SA。
-    pub const NUM_THREADS: usize =8;
+    pub const NUM_THREADS: usize = 8;
 
     // 单线程迭代步数：越多效果越好，但时间越长。
-    // 因为增量计算极快，建议 2000万 ~ 5000万 起步。
     pub const TOTAL_STEPS: usize = 10_000_000_000;
 
     // 初始温度：决定了算法开始时的"胡乱探索"程度。
     pub const TEMP_START: f64 = 3000.0;
     pub const TEMP_END: f64 = 0.001;
-    pub const DECAY_RATE: f64 = 0.999995;
+    pub const DECAY_RATE: f64 = 0.9999935;
 
     // [变异策略]
     // 交换概率：由"交换两个字根"而不是"移动一个字根"的概率。
     pub const SWAP_PROBABILITY: f64 = 0.6;  // 交换概率
 
     // [自适应降温参数]
-    pub const T_START_RATE: f64 = 0.00012;               // 高温温控系数
-    pub const T_END_RATE: f64 = 300.0;                   // 低温温控系数
+    pub const T_START_RATE: f64 = 0.00001;               // 高温温控系数
+    pub const T_END_RATE: f64 = 600.0;                   // 低温温控系数
     pub const T_PERTURBATION_RATE: f64 = 1.03;           // 扰动温控系数
     // 修改 reheat 和 perturbation 的温度判定
-    pub const REHEAT_THRESHOLD: f64 = 0.1;               // 加温阈值
+    pub const REHEAT_THRESHOLD: f64 = 0.2;               // 加温阈值
     pub const REHEAT_FACTOR: f64 = 2.0;                  // 温度回升因子
-    pub const MIN_IMPROVE_STEPS: usize = 1_000_000_000;  // 每10亿步无改进后考虑升温
-    pub const PERTURB_INTERVAL: usize = 2_000_000_000;   // 每20亿步无改进后扰动一次
-    pub const PERTURBATION_THRESHOLD: f64 = 0.3;         // 扰动阈值
+    pub const MIN_IMPROVE_STEPS: usize = config::TOTAL_STEPS / 30;    // 每3亿步无改进后考虑升温
+    pub const PERTURB_INTERVAL: usize = config::TOTAL_STEPS / 20;     // 每5亿步无改进后扰动一次
+    pub const PERTURBATION_THRESHOLD: f64 = 0.304;       // 扰动阈值
     pub const PERTURB_STRENGTH: f64 = 0.15;              // 扰动15%的字根
     pub const ACCEPTANCE_TARGET: f64 = 0.2;              // 目标接受率
 }
@@ -421,7 +420,7 @@ fn simulated_annealing(ctx: &OptContext, thread_id: usize, thread_dir: &str) -> 
             // 调整温度：如果接受率太低，需要升温；如果接受率合适，正常降温
             if acceptance_rate < config::ACCEPTANCE_TARGET * 0.5 && temp < t_start * config::T_START_RATE {
                 // 接受率太低，稍微升温
-                temp *= 1.005;
+                temp *= 1.00002;
             } else if acceptance_rate > config::ACCEPTANCE_TARGET * 1.5 && temp > t_end * config::T_END_RATE {
                 // 接受率太高，稍微降温
                 temp *= 0.95;
