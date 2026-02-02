@@ -6,7 +6,7 @@
 每	f
 双	g
 服	h
-击	i
+击	u o
 武	j
 哪	k
 数	l
@@ -19,8 +19,9 @@
 题	s
 衣	t
 周	u
-静	v
+静	e r
 伤	w
 百	x
 拿	y
-妈	z
+妈	z x e r u o
+空	_
