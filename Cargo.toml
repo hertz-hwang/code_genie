@@ -5,7 +5,19 @@ edition = "2021"
 
 [dependencies]
 chrono = "0.4"
-rand = "0.8"
-rayon = "1.9"
+rand = { version = "0.8", features = ["small_rng"] }
+rayon = "1.10"
+hashbrown = "0.14"
+rustc-hash = "1.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[[bin]]
+name = "three_code_optimizer"
+path = "src/main.rs"
