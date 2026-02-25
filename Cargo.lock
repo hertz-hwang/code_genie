@@ -71,6 +71,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "code_genie"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hashbrown",
+ "rand",
+ "rayon",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -354,19 +367,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "three_code_optimizer"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "hashbrown",
- "rand",
- "rayon",
- "rustc-hash",
- "serde",
- "serde_json",
 ]
 
 [[package]]

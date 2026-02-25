@@ -1,5 +1,5 @@
 [package]
-name = "three_code_optimizer"
+name = "code_genie"
 version = "0.1.0"
 edition = "2021"
 
@@ -19,5 +19,5 @@ codegen-units = 1
 panic = "abort"
 
 [[bin]]
-name = "three_code_optimizer"
+name = "code_genie"
 path = "src/main.rs"
