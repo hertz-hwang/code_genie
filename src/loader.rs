@@ -179,6 +179,95 @@ pub fn load_pair_equivalence(path: &str) -> [[f64; 31]; 31] {
     table
 }
 
+/// 从 keymap 文件加载字根到键位的映射
+///
+/// keymap 文件格式: 字根名\t编码\t使用次数
+/// 编码格式: 首字母大写的键位字符串，如 Wko -> [w, k, o]
+///
+/// 需要同时传入 division 文件路径，以确定每个基础字根的实际子字根后缀列表。
+/// 例如 keymap 中 `口	Wko` 表示口的编码为 [w, k, o]，
+/// 而 division 中口的子字根为 口、口.1、口.2，
+/// 因此映射为: 口=w, 口.1=k, 口.2=o
+///
+/// # 返回值
+/// - HashMap<String, u8>: 子字根名 -> 键位索引
+pub fn load_keymap(keymap_path: &str, division_path: &str) -> HashMap<String, u8> {
+    use crate::types::{extract_base_name, extract_suffix_num};
+
+    // 第一步：从 division 文件中提取每个基础字根的子字根后缀列表
+    let splits = load_splits(division_path);
+    let mut base_to_suffixes: HashMap<String, Vec<i32>> = HashMap::new();
+
+    for (_, roots, _) in &splits {
+        for root in roots {
+            let base = extract_base_name(root);
+            let suffix = extract_suffix_num(root);
+            let entry = base_to_suffixes.entry(base).or_default();
+            if !entry.contains(&suffix) {
+                entry.push(suffix);
+            }
+        }
+    }
+
+    // 对每个基础字根的后缀列表排序
+    for suffixes in base_to_suffixes.values_mut() {
+        suffixes.sort();
+    }
+
+    // 第二步：解析 keymap 文件
+    let content = fs::read_to_string(keymap_path).expect("无法读取 keymap 文件");
+    let mut root_to_key: HashMap<String, u8> = HashMap::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let base_name = parts[0].trim();
+        let encoding = parts[1].trim().to_lowercase();
+        let keys: Vec<u8> = encoding
+            .chars()
+            .filter_map(|c| char_to_key_index(c).map(|i| i as u8))
+            .collect();
+
+        if keys.is_empty() {
+            continue;
+        }
+
+        // 获取该基础字根的后缀列表
+        let suffixes = base_to_suffixes
+            .get(base_name)
+            .cloned()
+            .unwrap_or_else(|| {
+                // 如果 division 中没有该字根，使用默认后缀 [-1, 1, 2, ...]
+                let mut default_suffixes = vec![-1];
+                for i in 1..keys.len() as i32 {
+                    default_suffixes.push(i);
+                }
+                default_suffixes
+            });
+
+        // 将键位按后缀顺序映射到子字根名
+        for (i, &key) in keys.iter().enumerate() {
+            if i < suffixes.len() {
+                let suffix = suffixes[i];
+                let sub_name = if suffix < 0 {
+                    base_name.to_string()
+                } else {
+                    format!("{}.{}", base_name, suffix)
+                };
+                root_to_key.insert(sub_name, key);
+            }
+        }
+    }
+
+    root_to_key
+}
+
 /// 加载键位分布配置
 /// 
 /// # 返回值

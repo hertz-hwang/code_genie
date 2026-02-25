@@ -2,9 +2,11 @@
 // 🚀 字根编码优化器 - 主入口
 // =========================================================================
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use chrono::Local;
+use clap::{Parser, Subcommand};
 use rayon::prelude::*;
 
 mod annealing;
@@ -25,9 +27,543 @@ use crate::context::OptContext;
 use crate::evaluator::Evaluator;
 use crate::output::{save_results, save_summary, save_thread_results};
 use crate::simple::parse_simple_code_config;
-use crate::types::{SimpleCodeConfig, SimpleMetrics};
+use crate::types::{
+    key_to_char, SimpleCodeConfig, SimpleMetrics, EQUIV_TABLE_SIZE, KeyDistConfig,
+};
+
+// =========================================================================
+// CLI 定义
+// =========================================================================
+
+#[derive(Parser)]
+#[command(name = "CodeGenie", about = "字根编码优化器", version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// 运行模拟退火优化（默认行为）
+    Optimize,
+
+    /// 根据 keymap 为汉字编码
+    Encode {
+        /// 汉字拆分元素表
+        #[arg(short = 'd', long, default_value = "input-division.txt")]
+        division: String,
+
+        /// 逻辑字根映射文件（必需）
+        #[arg(short = 'k', long)]
+        keymap: String,
+
+        /// 编码输出文件
+        #[arg(short = 'o', long, default_value = "output-encode.txt")]
+        output: String,
+    },
+
+    /// 全方位评估编码方案
+    Evaluate {
+        /// 汉字拆分元素表
+        #[arg(short = 'd', long, default_value = "input-division.txt")]
+        division: String,
+
+        /// 逻辑字根映射文件（必需）
+        #[arg(short = 'k', long)]
+        keymap: String,
+
+        /// 目标键位分布文件
+        #[arg(long, default_value = "key_distribution.txt")]
+        keydist: String,
+
+        /// 当量数据文件
+        #[arg(long, default_value = "pair_equivalence.txt")]
+        equiv: String,
+
+        /// 简码规则文件（可选）
+        #[arg(long)]
+        simple: Option<String>,
+
+        /// 评估输出文件
+        #[arg(short = 'o', long, default_value = "output-evaluate.txt")]
+        output: String,
+    },
+}
+
+// =========================================================================
+// 主入口
+// =========================================================================
 
 fn main() {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Commands::Encode {
+            division,
+            keymap,
+            output,
+        }) => run_encode(&division, &keymap, &output),
+        Some(Commands::Evaluate {
+            division,
+            keymap,
+            keydist,
+            equiv,
+            simple,
+            output,
+        }) => run_evaluate(&division, &keymap, &keydist, &equiv, simple.as_deref(), &output),
+        Some(Commands::Optimize) | None => run_optimize(),
+    }
+}
+
+// =========================================================================
+// encode 子命令
+// =========================================================================
+
+fn run_encode(division_path: &str, keymap_path: &str, output_path: &str) {
+    println!("=== CodeGenie 编码模式 ===");
+    println!("  拆分表: {}", division_path);
+    println!("  键位映射: {}", keymap_path);
+    println!("  输出文件: {}", output_path);
+
+    // 加载数据
+    let root_to_key = loader::load_keymap(keymap_path, division_path);
+    let splits = loader::load_splits(division_path);
+
+    println!("  已加载 {} 个字根映射", root_to_key.len());
+    println!("  已加载 {} 个汉字拆分", splits.len());
+
+    // 为每个汉字编码
+    let mut code_out = String::new();
+    let mut missing_roots: HashMap<String, usize> = HashMap::new();
+    let mut encoded_count = 0usize;
+    let mut failed_count = 0usize;
+
+    for (ch, roots, freq) in &splits {
+        let mut code_parts = Vec::new();
+        let mut all_found = true;
+
+        for root in roots {
+            if let Some(&key) = root_to_key.get(root) {
+                code_parts.push(key_to_char(key));
+            } else {
+                all_found = false;
+                *missing_roots.entry(root.clone()).or_default() += 1;
+            }
+        }
+
+        if all_found && !code_parts.is_empty() {
+            let code_str: String = code_parts.into_iter().collect();
+            code_out.push_str(&format!("{}\t{}\t{}\n", ch, code_str, freq));
+            encoded_count += 1;
+        } else {
+            // 即使有缺失字根，也输出已有部分（用 ? 标记缺失）
+            let mut partial_code = Vec::new();
+            for root in roots {
+                if let Some(&key) = root_to_key.get(root) {
+                    partial_code.push(key_to_char(key));
+                } else {
+                    partial_code.push('?');
+                }
+            }
+            let code_str: String = partial_code.into_iter().collect();
+            code_out.push_str(&format!("{}\t{}\t{}\n", ch, code_str, freq));
+            failed_count += 1;
+        }
+    }
+
+    // 写入文件
+    std::fs::write(output_path, &code_out).expect("无法写入编码输出文件");
+
+    println!("\n✅ 编码完成:");
+    println!("  成功编码: {} 字", encoded_count);
+    if failed_count > 0 {
+        println!("  ⚠️ 部分编码: {} 字（存在未映射字根）", failed_count);
+    }
+    if !missing_roots.is_empty() {
+        println!("  ⚠️ 未找到映射的字根 ({} 种):", missing_roots.len());
+        let mut sorted: Vec<_> = missing_roots.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        for (root, count) in sorted.iter().take(20) {
+            println!("    {} (出现 {} 次)", root, count);
+        }
+        if sorted.len() > 20 {
+            println!("    ... 还有 {} 种", sorted.len() - 20);
+        }
+    }
+    println!("  结果已保存至 {}", output_path);
+}
+
+// =========================================================================
+// evaluate 子命令
+// =========================================================================
+
+fn run_evaluate(
+    division_path: &str,
+    keymap_path: &str,
+    keydist_path: &str,
+    equiv_path: &str,
+    simple_path: Option<&str>,
+    output_path: &str,
+) {
+    println!("=== CodeGenie 评估模式 ===");
+    println!("  拆分表: {}", division_path);
+    println!("  键位映射: {}", keymap_path);
+    println!("  键位分布: {}", keydist_path);
+    println!("  当量数据: {}", equiv_path);
+    if let Some(sp) = simple_path {
+        println!("  简码规则: {}", sp);
+    }
+    println!("  输出文件: {}", output_path);
+
+    // 加载数据
+    let root_to_key = loader::load_keymap(keymap_path, division_path);
+    let splits = loader::load_splits(division_path);
+    let equiv_table = loader::load_pair_equivalence(equiv_path);
+    let key_dist_config = loader::load_key_distribution(keydist_path);
+
+    println!("  已加载 {} 个字根映射", root_to_key.len());
+    println!("  已加载 {} 个汉字拆分", splits.len());
+
+    // 加载简码配置（如果指定）
+    let simple_config = if let Some(sp) = simple_path {
+        let cfg = parse_simple_code_config(sp);
+        println!("  已加载简码配置: {} 级", cfg.levels.len());
+        cfg
+    } else {
+        SimpleCodeConfig { levels: vec![] }
+    };
+
+    // 将所有字根作为 fixed_roots，groups 为空
+    let fixed_roots: HashMap<String, u8> = root_to_key;
+    let groups: Vec<types::RootGroup> = vec![];
+    let assignment: Vec<u8> = vec![];
+
+    // 构建 OptContext
+    let scale_config = types::ScaleConfig::default();
+    let ctx = OptContext::new(
+        &splits,
+        &fixed_roots,
+        &groups,
+        equiv_table,
+        key_dist_config,
+        scale_config,
+        simple_config,
+    );
+
+    println!("  编码基数: {}", ctx.code_base);
+    println!("  编码空间: {}", ctx.code_space);
+    println!("  最大码长: {}", ctx.max_parts);
+
+    // 运行评估
+    let evaluator = Evaluator::new(&ctx, &assignment);
+    let metrics = evaluator.get_metrics(&ctx);
+    let simple_metrics = evaluator.get_simple_metrics(&ctx);
+
+    // 打印评估结果
+    println!("\n📊 评估结果:");
+    println!("  ═══════════════════════════════════════");
+    println!("  「全码」重码数:          {}", metrics.collision_count);
+    println!(
+        "  「全码」重码率:          {:.6}%",
+        metrics.collision_rate * 100.0
+    );
+    println!(
+        "  「全码」加权键均当量:    {:.4}",
+        metrics.equiv_mean
+    );
+    println!(
+        "  「全码」当量变异系数(CV): {:.4}",
+        metrics.equiv_cv
+    );
+    println!(
+        "  「全码」用指分布偏差(L2): {:.4}",
+        metrics.dist_deviation
+    );
+
+    if !ctx.simple_config.levels.is_empty() {
+        println!("  ─────────────────────────────────────");
+        println!(
+            "  「简码」重码数:          {}",
+            simple_metrics.collision_count
+        );
+        println!(
+            "  「简码」重码率:          {:.6}%",
+            simple_metrics.collision_rate * 100.0
+        );
+        println!(
+            "  「简码」覆盖率:          {:.4}%",
+            simple_metrics.weighted_freq_coverage * 100.0
+        );
+        println!(
+            "  「简码」加权当量:        {:.4}",
+            simple_metrics.equiv_mean
+        );
+        println!(
+            "  「简码」分布偏差:        {:.4}",
+            simple_metrics.dist_deviation
+        );
+    }
+    println!("  ═══════════════════════════════════════");
+
+    // 生成详细评估报告
+    let report = build_evaluate_report(
+        &ctx,
+        &assignment,
+        &evaluator,
+        &metrics,
+        &simple_metrics,
+        &key_dist_config,
+    );
+
+    std::fs::write(output_path, &report).expect("无法写入评估输出文件");
+    println!("\n✅ 详细评估报告已保存至 {}", output_path);
+}
+
+/// 构建详细评估报告
+fn build_evaluate_report(
+    ctx: &OptContext,
+    assignment: &[u8],
+    evaluator: &Evaluator,
+    metrics: &types::Metrics,
+    simple_metrics: &SimpleMetrics,
+    key_dist_config: &[KeyDistConfig; EQUIV_TABLE_SIZE],
+) -> String {
+    let mut out = String::new();
+
+    // ===== 总览 =====
+    out.push_str("# CodeGenie 编码方案评估报告\n");
+    out.push_str("#\n");
+    out.push_str(&format!("# 汉字数量: {}\n", ctx.char_infos.len()));
+    out.push_str(&format!("# 总字频: {}\n", ctx.total_frequency));
+    out.push_str(&format!("# 编码基数: {}\n", ctx.code_base));
+    out.push_str(&format!("# 最大码长: {}\n", ctx.max_parts));
+    out.push_str("#\n");
+
+    // ===== 全码指标 =====
+    out.push_str("# ═══════════════════════════════════════\n");
+    out.push_str("# 全码指标\n");
+    out.push_str("# ═══════════════════════════════════════\n");
+    out.push_str(&format!("# 重码数: {}\n", metrics.collision_count));
+    out.push_str(&format!(
+        "# 重码率: {:.6}%\n",
+        metrics.collision_rate * 100.0
+    ));
+    out.push_str(&format!(
+        "# 加权键均当量: {:.4}\n",
+        metrics.equiv_mean
+    ));
+    out.push_str(&format!(
+        "# 当量变异系数(CV): {:.4}\n",
+        metrics.equiv_cv
+    ));
+    out.push_str(&format!(
+        "# 用指分布偏差(L2): {:.4}\n",
+        metrics.dist_deviation
+    ));
+    out.push_str("#\n");
+
+    // ===== 简码指标 =====
+    if !ctx.simple_config.levels.is_empty() {
+        out.push_str("# ═══════════════════════════════════════\n");
+        out.push_str("# 简码指标\n");
+        out.push_str("# ═══════════════════════════════════════\n");
+        out.push_str(&format!(
+            "# 简码重码数: {}\n",
+            simple_metrics.collision_count
+        ));
+        out.push_str(&format!(
+            "# 简码重码率: {:.6}%\n",
+            simple_metrics.collision_rate * 100.0
+        ));
+        out.push_str(&format!(
+            "# 简码覆盖率: {:.4}%\n",
+            simple_metrics.weighted_freq_coverage * 100.0
+        ));
+        out.push_str(&format!(
+            "# 简码加权当量: {:.4}\n",
+            simple_metrics.equiv_mean
+        ));
+        out.push_str(&format!(
+            "# 简码分布偏差: {:.4}\n",
+            simple_metrics.dist_deviation
+        ));
+        out.push_str("#\n");
+    }
+
+    // ===== 用指分布 =====
+    out.push_str("\n# ═══════════════════════════════════════\n");
+    out.push_str("# 用指分布\n");
+    out.push_str("# ═══════════════════════════════════════\n");
+    out.push_str("# 键位\t实际%\t目标%\t偏差\t偏差²\n");
+
+    let inv_tkp = evaluator.inv_total_key_presses;
+    for kc in config::KEY_DISPLAY_ORDER.chars() {
+        if let Some(ki) = types::char_to_key_index(kc) {
+            if ki >= 31 {
+                continue;
+            }
+            let actual = evaluator.key_weighted_usage[ki] * 100.0 * inv_tkp;
+            let target = key_dist_config[ki].target_rate;
+            let diff = actual - target;
+            out.push_str(&format!(
+                "{}\t{:.4}\t{:.4}\t{:+.4}\t{:.4}\n",
+                kc,
+                actual,
+                target,
+                diff,
+                diff * diff
+            ));
+        }
+    }
+
+    // 特殊键位
+    let order_set: std::collections::HashSet<char> =
+        config::KEY_DISPLAY_ORDER.chars().collect();
+    let special_keys = [('_', 26usize), (';', 27), (',', 28), ('.', 29), ('/', 30)];
+    for (kc, ki) in &special_keys {
+        if !order_set.contains(kc) && *ki < 31 {
+            let usage = evaluator.key_weighted_usage[*ki];
+            if usage > 0.0 {
+                let actual = usage * 100.0 * inv_tkp;
+                let target = key_dist_config[*ki].target_rate;
+                let diff = actual - target;
+                out.push_str(&format!(
+                    "{}\t{:.4}\t{:.4}\t{:+.4}\t{:.4}\n",
+                    kc,
+                    actual,
+                    target,
+                    diff,
+                    diff * diff
+                ));
+            }
+        }
+    }
+
+    // ===== 当量分布 =====
+    out.push_str("\n# ═══════════════════════════════════════\n");
+    out.push_str("# 当量分布\n");
+    out.push_str("# ═══════════════════════════════════════\n");
+    out.push_str(&format!("# 平均当量: {:.4}\n", metrics.equiv_mean));
+    out.push_str(&format!(
+        "# 变异系数(CV): {:.4}\n",
+        metrics.equiv_cv
+    ));
+    out.push_str(&format!(
+        "# 标准差: {:.4}\n",
+        metrics.equiv_cv * metrics.equiv_mean
+    ));
+
+    // 计算每个汉字的当量
+    let mut char_equivs: Vec<(char, f64, u64)> = Vec::new();
+    for (i, (ch, _, _)) in ctx.raw_splits.iter().enumerate() {
+        let equiv = ctx.calc_equiv_from_parts(i, assignment);
+        char_equivs.push((*ch, equiv, ctx.char_infos[i].frequency));
+    }
+    char_equivs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    out.push_str("#\n# 当量最高的20个高频字 (字频>1000000):\n# 汉字\t当量\t字频\n");
+    let mut count = 0;
+    for (ch, eq, freq) in &char_equivs {
+        if *freq > 1_000_000 && count < 20 {
+            out.push_str(&format!("{}\t{:.4}\t{}\n", ch, eq, freq));
+            count += 1;
+        }
+    }
+
+    out.push_str("#\n# 当量最低的20个高频字 (字频>1000000):\n");
+    let high: Vec<_> = char_equivs
+        .iter()
+        .filter(|(_, _, f)| *f > 1_000_000)
+        .collect();
+    let start = high.len().saturating_sub(20);
+    for (ch, eq, freq) in high.iter().skip(start) {
+        out.push_str(&format!("{}\t{:.4}\t{}\n", ch, eq, freq));
+    }
+
+    // ===== 重码详情 =====
+    out.push_str("\n# ═══════════════════════════════════════\n");
+    out.push_str("# 重码详情\n");
+    out.push_str("# ═══════════════════════════════════════\n");
+
+    // 构建编码到汉字的映射
+    let n = ctx.char_infos.len();
+    let mut code_to_chars: HashMap<usize, Vec<usize>> = HashMap::new();
+    for ci in 0..n {
+        let code = ctx.calc_code_only(ci, assignment);
+        code_to_chars.entry(code).or_default().push(ci);
+    }
+
+    // 收集重码组
+    let mut collision_groups: Vec<(usize, Vec<(char, u64)>)> = Vec::new();
+    for (code, chars) in &code_to_chars {
+        if chars.len() >= 2 {
+            let mut group: Vec<(char, u64)> = chars
+                .iter()
+                .map(|&ci| (ctx.raw_splits[ci].0, ctx.char_infos[ci].frequency))
+                .collect();
+            group.sort_by(|a, b| b.1.cmp(&a.1));
+            collision_groups.push((*code, group));
+        }
+    }
+
+    // 按组内最高频率降序排序
+    collision_groups.sort_by(|a, b| {
+        let max_a = a.1.first().map(|x| x.1).unwrap_or(0);
+        let max_b = b.1.first().map(|x| x.1).unwrap_or(0);
+        max_b.cmp(&max_a)
+    });
+
+    out.push_str(&format!(
+        "# 共 {} 组重码 (按最高频率降序)\n",
+        collision_groups.len()
+    ));
+    out.push_str("# 编码\t重码字\t字频列表\n");
+
+    for (_, group) in collision_groups.iter().take(200) {
+        let chars_str: String = group.iter().map(|(ch, _)| *ch).collect();
+        let freqs_str: String = group
+            .iter()
+            .map(|(_, f)| f.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // 获取编码字符串
+        let first_ci = code_to_chars
+            .values()
+            .find(|v| v.len() >= 2 && ctx.raw_splits[v[0]].0 == group[0].0)
+            .and_then(|v| v.first())
+            .copied();
+
+        let code_str = if let Some(ci) = first_ci {
+            let info = &ctx.char_infos[ci];
+            let keys: String = info
+                .parts
+                .iter()
+                .map(|&p| key_to_char(ctx.resolve_key(p, assignment)))
+                .collect();
+            keys
+        } else {
+            "?".to_string()
+        };
+
+        out.push_str(&format!("{}\t{}\t{}\n", code_str, chars_str, freqs_str));
+    }
+
+    if collision_groups.len() > 200 {
+        out.push_str(&format!(
+            "# ... 还有 {} 组重码未列出\n",
+            collision_groups.len() - 200
+        ));
+    }
+
+    out
+}
+
+// =========================================================================
+// optimize 子命令（原有优化流程）
+// =========================================================================
+
+fn run_optimize() {
     let start_time = Instant::now();
     println!("=== CodeGenie 字劫算法优化器 v9 (Auto-Scaling + Simple Code Collision) ===");
 
@@ -216,7 +752,7 @@ fn main() {
                 let full_keys: Vec<char> = lr
                     .full_code_parts
                     .iter()
-                    .map(|&p| types::key_to_char(temp_ctx.resolve_key(p, &initial_assignment)))
+                    .map(|&p| key_to_char(temp_ctx.resolve_key(p, &initial_assignment)))
                     .collect();
                 println!(
                     "      逻辑根[{}] '{}': 拆分中占位={:?}, 完整编码={:?}",
@@ -230,7 +766,7 @@ fn main() {
                         .map(|&(root_idx, code_idx)| {
                             let lr = &si.logical_roots[root_idx];
                             let part = lr.full_code_parts[code_idx];
-                            types::key_to_char(temp_ctx.resolve_key(part, &initial_assignment))
+                            key_to_char(temp_ctx.resolve_key(part, &initial_assignment))
                         })
                         .collect();
                     let level_cfg = &temp_ctx.simple_config.levels[li];

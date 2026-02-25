@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
 rand = { version = "0.8", features = ["small_rng"] }
 rayon = "1.10"
 hashbrown = "0.14"

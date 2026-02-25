@@ -89,9 +89,9 @@ pub fn validate_weights() {
 /// 并行线程数
 pub const NUM_THREADS: usize = 16;
 /// 总迭代步数
-pub const TOTAL_STEPS: usize = 100_000;
+pub const TOTAL_STEPS: usize = 10_000;
 /// 初始温度
-pub const TEMP_START: f64 = 100.0;
+pub const TEMP_START: f64 = 1.0;
 /// 结束温度
 pub const TEMP_END: f64 = 0.000001;
 /// 舒适温度区间
