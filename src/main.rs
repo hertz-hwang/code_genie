@@ -23,10 +23,10 @@ mod validate;
 
 use crate::annealing::simulated_annealing;
 use crate::calibrate::calibrate_scales;
+use crate::config::Config;
 use crate::context::OptContext;
 use crate::evaluator::Evaluator;
 use crate::output::{save_results, save_summary, save_thread_results};
-use crate::simple::parse_simple_code_config;
 use crate::types::{
     key_to_char, SimpleCodeConfig, SimpleMetrics, EQUIV_TABLE_SIZE, KeyDistConfig,
 };
@@ -38,6 +38,10 @@ use crate::types::{
 #[derive(Parser)]
 #[command(name = "CodeGenie", about = "字根编码优化器", version)]
 struct Cli {
+    /// 配置文件路径
+    #[arg(short = 'c', long, default_value = "config.toml")]
+    config: String,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -50,8 +54,8 @@ enum Commands {
     /// 根据 keymap 为汉字编码
     Encode {
         /// 汉字拆分元素表
-        #[arg(short = 'd', long, default_value = "input-division.txt")]
-        division: String,
+        #[arg(short = 'd', long)]
+        division: Option<String>,
 
         /// 逻辑字根映射文件（必需）
         #[arg(short = 'k', long)]
@@ -65,20 +69,20 @@ enum Commands {
     /// 全方位评估编码方案
     Evaluate {
         /// 汉字拆分元素表
-        #[arg(short = 'd', long, default_value = "input-division.txt")]
-        division: String,
+        #[arg(short = 'd', long)]
+        division: Option<String>,
 
         /// 逻辑字根映射文件（必需）
         #[arg(short = 'k', long)]
         keymap: String,
 
         /// 目标键位分布文件
-        #[arg(long, default_value = "key_distribution.txt")]
-        keydist: String,
+        #[arg(long)]
+        keydist: Option<String>,
 
         /// 当量数据文件
-        #[arg(long, default_value = "pair_equivalence.txt")]
-        equiv: String,
+        #[arg(long)]
+        equiv: Option<String>,
 
         /// 简码规则文件（可选）
         #[arg(long)]
@@ -97,12 +101,18 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
 
+    // 加载配置
+    let cfg = Config::load_from_path(&cli.config);
+
     match cli.command {
         Some(Commands::Encode {
             division,
             keymap,
             output,
-        }) => run_encode(&division, &keymap, &output),
+        }) => {
+            let division_path = division.as_deref().unwrap_or(&cfg.files.splits);
+            run_encode(division_path, &keymap, &output);
+        }
         Some(Commands::Evaluate {
             division,
             keymap,
@@ -110,8 +120,21 @@ fn main() {
             equiv,
             simple,
             output,
-        }) => run_evaluate(&division, &keymap, &keydist, &equiv, simple.as_deref(), &output),
-        Some(Commands::Optimize) | None => run_optimize(),
+        }) => {
+            let division_path = division.as_deref().unwrap_or(&cfg.files.splits);
+            let keydist_path = keydist.as_deref().unwrap_or(&cfg.files.key_dist);
+            let equiv_path = equiv.as_deref().unwrap_or(&cfg.files.pair_equiv);
+            run_evaluate(
+                &cfg,
+                division_path,
+                &keymap,
+                keydist_path,
+                equiv_path,
+                simple.as_deref(),
+                &output,
+            );
+        }
+        Some(Commands::Optimize) | None => run_optimize(&cfg),
     }
 }
 
@@ -198,6 +221,7 @@ fn run_encode(division_path: &str, keymap_path: &str, output_path: &str) {
 // =========================================================================
 
 fn run_evaluate(
+    cfg: &Config,
     division_path: &str,
     keymap_path: &str,
     keydist_path: &str,
@@ -224,13 +248,13 @@ fn run_evaluate(
     println!("  已加载 {} 个字根映射", root_to_key.len());
     println!("  已加载 {} 个汉字拆分", splits.len());
 
-    // 加载简码配置（如果指定）
+    // 加载简码配置
     let simple_config = if let Some(sp) = simple_path {
-        let cfg = parse_simple_code_config(sp);
-        println!("  已加载简码配置: {} 级", cfg.levels.len());
-        cfg
+        let scfg = simple::parse_simple_code_config(sp);
+        println!("  已加载简码配置: {} 级", scfg.levels.len());
+        scfg
     } else {
-        SimpleCodeConfig { levels: vec![] }
+        cfg.get_simple_code_config()
     };
 
     // 将所有字根作为 fixed_roots，groups 为空
@@ -240,6 +264,7 @@ fn run_evaluate(
 
     // 构建 OptContext
     let scale_config = types::ScaleConfig::default();
+    let weights = cfg.get_weight_config();
     let ctx = OptContext::new(
         &splits,
         &fixed_roots,
@@ -248,6 +273,7 @@ fn run_evaluate(
         key_dist_config,
         scale_config,
         simple_config,
+        weights,
     );
 
     println!("  编码基数: {}", ctx.code_base);
@@ -307,6 +333,7 @@ fn run_evaluate(
 
     // 生成详细评估报告
     let report = build_evaluate_report(
+        cfg,
         &ctx,
         &assignment,
         &evaluator,
@@ -321,6 +348,7 @@ fn run_evaluate(
 
 /// 构建详细评估报告
 fn build_evaluate_report(
+    cfg: &Config,
     ctx: &OptContext,
     assignment: &[u8],
     evaluator: &Evaluator,
@@ -397,7 +425,7 @@ fn build_evaluate_report(
     out.push_str("# 键位\t实际%\t目标%\t偏差\t偏差²\n");
 
     let inv_tkp = evaluator.inv_total_key_presses;
-    for kc in config::KEY_DISPLAY_ORDER.chars() {
+    for kc in cfg.keys.display_order.chars() {
         if let Some(ki) = types::char_to_key_index(kc) {
             if ki >= 31 {
                 continue;
@@ -417,8 +445,7 @@ fn build_evaluate_report(
     }
 
     // 特殊键位
-    let order_set: std::collections::HashSet<char> =
-        config::KEY_DISPLAY_ORDER.chars().collect();
+    let order_set: std::collections::HashSet<char> = cfg.keys.display_order.chars().collect();
     let special_keys = [('_', 26usize), (';', 27), (',', 28), ('.', 29), ('/', 30)];
     for (kc, ki) in &special_keys {
         if !order_set.contains(kc) && *ki < 31 {
@@ -563,54 +590,52 @@ fn build_evaluate_report(
 // optimize 子命令（原有优化流程）
 // =========================================================================
 
-fn run_optimize() {
+fn run_optimize(cfg: &Config) {
     let start_time = Instant::now();
-    println!("=== CodeGenie 字劫算法优化器 v9 (Auto-Scaling + Simple Code Collision) ===");
+    println!("=== CodeGenie 字劫算法优化器 v10 ===");
 
     // 验证配置
-    config::validate_weights();
+    cfg.validate_weights();
 
     // 打印配置信息
     println!(
         "线程数: {}, 总步数: {}",
-        config::NUM_THREADS,
-        config::TOTAL_STEPS
+        cfg.annealing.threads, cfg.annealing.total_steps
     );
     println!(
         "初始温度: {}, 结束温度: {}",
-        config::TEMP_START,
-        config::TEMP_END
+        cfg.annealing.temp_start, cfg.annealing.temp_end
     );
-    println!("全局允许键位: {}", config::ALLOWED_KEYS);
+    println!("全局允许键位: {}", cfg.keys.allowed);
     println!(
         "全码权重: 重码数={:.2}, 重码率={:.2}, 当量={:.2}, CV={:.2}, 分布={:.2}",
-        config::WEIGHT_COLLISION_COUNT,
-        config::WEIGHT_COLLISION_RATE,
-        config::WEIGHT_EQUIVALENCE,
-        config::WEIGHT_EQUIV_CV,
-        config::WEIGHT_DISTRIBUTION
+        cfg.weights.full_code.collision_count,
+        cfg.weights.full_code.collision_rate,
+        cfg.weights.full_code.equivalence,
+        cfg.weights.full_code.equiv_cv,
+        cfg.weights.full_code.distribution,
     );
     println!(
         "简码优化: {} (全码占比={:.0}%, 简码占比={:.0}%)",
-        if config::ENABLE_SIMPLE_CODE {
+        if cfg.weights.simple_code.enabled {
             "开启"
         } else {
             "关闭"
         },
-        config::WEIGHT_FULL_CODE * 100.0,
-        config::WEIGHT_SIMPLE_CODE * 100.0
+        cfg.weights.simple_code.full_code_weight * 100.0,
+        cfg.weights.simple_code.simple_code_weight * 100.0
     );
-    if config::ENABLE_SIMPLE_CODE {
+    if cfg.weights.simple_code.enabled {
         println!(
             "简码子权重: 频率覆盖={:.2}, 当量={:.2}, 分布={:.2}, 重码数={:.2}, 重码率={:.2}",
-            config::SIMPLE_WEIGHT_FREQ,
-            config::SIMPLE_WEIGHT_EQUIV,
-            config::SIMPLE_WEIGHT_DIST,
-            config::SIMPLE_WEIGHT_COLLISION_COUNT,
-            config::SIMPLE_WEIGHT_COLLISION_RATE
+            cfg.weights.simple_code.freq,
+            cfg.weights.simple_code.equiv,
+            cfg.weights.simple_code.dist,
+            cfg.weights.simple_code.collision_count,
+            cfg.weights.simple_code.collision_rate,
         );
     }
-    println!("用指分布输出顺序: {}", config::KEY_DISPLAY_ORDER);
+    println!("用指分布输出顺序: {}", cfg.keys.display_order);
 
     // 创建输出目录
     let timestamp = Local::now().format("%Y%m%d%H%M%S").to_string();
@@ -619,17 +644,17 @@ fn run_optimize() {
     println!("输出目录: {}", output_dir);
 
     // ==================== 加载数据 ====================
-    let (fixed_roots, constrained) = loader::load_fixed(config::FILE_FIXED);
-    let dynamic_groups = loader::load_dynamic(config::FILE_DYNAMIC, &constrained);
-    let splits = loader::load_splits(config::FILE_SPLITS);
-    let equiv_table = loader::load_pair_equivalence(config::FILE_PAIR_EQUIV);
-    let key_dist_config = loader::load_key_distribution(config::FILE_KEY_DIST);
+    let (fixed_roots, constrained) = loader::load_fixed(&cfg.files.fixed);
+    let dynamic_groups = loader::load_dynamic(&cfg.files.dynamic, &constrained, &cfg.keys.allowed);
+    let splits = loader::load_splits(&cfg.files.splits);
+    let equiv_table = loader::load_pair_equivalence(&cfg.files.pair_equiv);
+    let key_dist_config = loader::load_key_distribution(&cfg.files.key_dist);
 
     // 加载简码配置
-    let simple_config = if config::ENABLE_SIMPLE_CODE {
-        let cfg = parse_simple_code_config(config::FILE_SIMPLE);
+    let simple_config = if cfg.weights.simple_code.enabled {
+        let scfg = cfg.get_simple_code_config();
         println!("\n📋 简码配置:");
-        for level in &cfg.levels {
+        for level in &scfg.levels {
             let rules_str: String = level
                 .rule_candidates
                 .iter()
@@ -645,7 +670,7 @@ fn run_optimize() {
                 level.level, level.code_num, rules_str
             );
         }
-        cfg
+        scfg
     } else {
         SimpleCodeConfig { levels: vec![] }
     };
@@ -668,11 +693,10 @@ fn run_optimize() {
     println!("  - 最大码长: {}", max_parts_in_data);
 
     // 警告：最大码长超过配置
-    if max_parts_in_data > config::MAX_PARTS {
+    if max_parts_in_data > cfg.annealing.max_parts {
         println!(
-            "⚠️ 拆分表中最大码长({})超过 MAX_PARTS({}), 请调大 config::MAX_PARTS",
-            max_parts_in_data,
-            config::MAX_PARTS
+            "⚠️ 拆分表中最大码长({})超过 max_parts({}), 请调大配置",
+            max_parts_in_data, cfg.annealing.max_parts
         );
     }
 
@@ -684,6 +708,7 @@ fn run_optimize() {
     // ==================== 初始校准 ====================
     println!("\n📐 正在进行初始尺度校准...");
     let temp_scale = types::ScaleConfig::default();
+    let weights = cfg.get_weight_config();
     let temp_ctx = OptContext::new(
         &splits,
         &fixed_roots,
@@ -692,14 +717,16 @@ fn run_optimize() {
         key_dist_config,
         temp_scale,
         simple_config.clone(),
+        weights,
     );
 
-    let initial_assignment = annealing::smart_init(&temp_ctx);
+    let initial_assignment = annealing::smart_init(&temp_ctx, cfg);
     let initial_eval = Evaluator::new(&temp_ctx, &initial_assignment);
     let initial_metrics = initial_eval.get_metrics(&temp_ctx);
     let initial_simple_metrics = initial_eval.get_simple_metrics(&temp_ctx);
 
-    let scale_config = calibrate_scales(&initial_metrics, &initial_simple_metrics);
+    let weights = cfg.get_weight_config();
+    let scale_config = calibrate_scales(&initial_metrics, &initial_simple_metrics, &weights);
 
     println!("  初始状态观测:");
     println!(
@@ -710,7 +737,7 @@ fn run_optimize() {
         "    当量: {:.4},  CV: {:.4}",
         initial_metrics.equiv_mean, initial_metrics.equiv_cv
     );
-    if config::ENABLE_SIMPLE_CODE {
+    if cfg.weights.simple_code.enabled {
         println!(
             "    简码覆盖: {:.4}%,  简码当量: {:.4},  简码分布: {:.4}",
             initial_simple_metrics.weighted_freq_coverage * 100.0,
@@ -727,7 +754,7 @@ fn run_optimize() {
     println!("    CollisionCount: {:.6}", scale_config.collision_count);
     println!("    CollisionRate:  {:.6}", scale_config.collision_rate);
     println!("    Equivalence:    {:.6}", scale_config.equivalence);
-    if config::ENABLE_SIMPLE_CODE {
+    if cfg.weights.simple_code.enabled {
         println!("    SimpleFreq:     {:.6}", scale_config.simple_freq);
         println!("    SimpleEquiv:    {:.6}", scale_config.simple_equiv);
         println!("    SimpleDist:     {:.6}", scale_config.simple_dist);
@@ -742,7 +769,7 @@ fn run_optimize() {
     }
 
     // 逻辑根验证（仅在启用简码时）
-    if config::ENABLE_SIMPLE_CODE {
+    if cfg.weights.simple_code.enabled {
         println!("\n  📝 逻辑根解析验证 (前3字):");
         for ci in 0..3.min(temp_ctx.raw_splits.len()) {
             let (ch, roots, _) = &temp_ctx.raw_splits[ci];
@@ -826,8 +853,8 @@ fn run_optimize() {
     }
 
     // ==================== 正式优化 ====================
-    let equiv_table_2 = loader::load_pair_equivalence(config::FILE_PAIR_EQUIV);
-    let key_dist_config_2 = loader::load_key_distribution(config::FILE_KEY_DIST);
+    let equiv_table_2 = loader::load_pair_equivalence(&cfg.files.pair_equiv);
+    let key_dist_config_2 = loader::load_key_distribution(&cfg.files.key_dist);
 
     let ctx = OptContext::new(
         &splits,
@@ -837,6 +864,7 @@ fn run_optimize() {
         key_dist_config_2,
         scale_config,
         simple_config,
+        weights,
     );
 
     println!("\n  - 编码基数: {}", ctx.code_base);
@@ -846,9 +874,10 @@ fn run_optimize() {
 
     // 并行执行模拟退火
     println!("\n🚀 开始优化...");
-    let results: Vec<(Vec<u8>, f64, types::Metrics, SimpleMetrics)> = (0..config::NUM_THREADS)
+    let num_threads = cfg.annealing.threads;
+    let results: Vec<(Vec<u8>, f64, types::Metrics, SimpleMetrics)> = (0..num_threads)
         .into_par_iter()
-        .map(|i| simulated_annealing(&ctx, i))
+        .map(|i| simulated_annealing(&ctx, cfg, i))
         .collect();
 
     let all_results: Vec<(usize, Vec<u8>, f64, types::Metrics, SimpleMetrics)> = results
@@ -877,7 +906,7 @@ fn run_optimize() {
     println!("   「全码」加权键均当量: {:.4}", m.equiv_mean);
     println!("   「全码」当量变异系数(CV): {:.4}", m.equiv_cv);
     println!("   「全码」用指分布偏差(L2): {:.4}", m.dist_deviation);
-    if config::ENABLE_SIMPLE_CODE {
+    if cfg.weights.simple_code.enabled {
         println!("---------------------------------");
         println!("   「简码」重码数: {}", sm.collision_count);
         println!("   「简码」重码率: {:.6}%", sm.collision_rate * 100.0);
@@ -915,7 +944,7 @@ fn run_optimize() {
         &output_dir,
         &root_usage,
     );
-    save_summary(&all_results, best_thread, &output_dir, elapsed);
+    save_summary(cfg, &all_results, best_thread, &output_dir, elapsed);
 
     println!("\n所有结果已保存至 {}/", output_dir);
     println!("  - summary.txt              汇总排名");

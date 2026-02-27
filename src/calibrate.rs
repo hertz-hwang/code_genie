@@ -2,22 +2,25 @@
 // 📐 自动校准模块
 // =========================================================================
 
-use crate::config;
-use crate::types::{Metrics, ScaleConfig, SimpleMetrics};
+use crate::types::{Metrics, ScaleConfig, SimpleMetrics, WeightConfig};
 
 /// 根据初始状态自动校准缩放因子
 /// 
 /// 使得不同量纲的指标在得分计算中具有相当的权重
-pub fn calibrate_scales(initial_metrics: &Metrics, initial_simple: &SimpleMetrics) -> ScaleConfig {
+pub fn calibrate_scales(
+    initial_metrics: &Metrics,
+    initial_simple: &SimpleMetrics,
+    weights: &WeightConfig,
+) -> ScaleConfig {
     let eps = 1e-9;
 
     // 计算活跃的全码指标数量
     let active_count = [
-        config::WEIGHT_COLLISION_COUNT,
-        config::WEIGHT_COLLISION_RATE,
-        config::WEIGHT_EQUIVALENCE,
-        config::WEIGHT_EQUIV_CV,
-        config::WEIGHT_DISTRIBUTION,
+        weights.weight_collision_count,
+        weights.weight_collision_rate,
+        weights.weight_equivalence,
+        weights.weight_equiv_cv,
+        weights.weight_distribution,
     ]
     .iter()
     .filter(|&&w| w > 0.0)
@@ -39,7 +42,7 @@ pub fn calibrate_scales(initial_metrics: &Metrics, initial_simple: &SimpleMetric
     };
 
     // 如果未启用简码，返回基础配置
-    if !config::ENABLE_SIMPLE_CODE {
+    if !weights.enable_simple_code {
         return base;
     }
 

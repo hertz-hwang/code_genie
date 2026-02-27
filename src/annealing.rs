@@ -4,14 +4,14 @@
 
 use rand::prelude::*;
 
-use crate::config;
+use crate::config::Config;
 use crate::context::OptContext;
 use crate::evaluator::Evaluator;
 use crate::schedule::TemperatureSchedule;
 use crate::types::{char_to_key_index, Metrics, SimpleMetrics, KEY_SPACE};
 
 /// 智能初始化 - 使用贪心算法生成初始分配
-pub fn smart_init(ctx: &OptContext) -> Vec<u8> {
+pub fn smart_init(ctx: &OptContext, cfg: &Config) -> Vec<u8> {
     let mut assignment = vec![0u8; ctx.num_groups];
     let mut rng = thread_rng();
 
@@ -24,7 +24,9 @@ pub fn smart_init(ctx: &OptContext) -> Vec<u8> {
         .collect();
     group_freq.sort_by(|a, b| b.1.cmp(&a.1));
 
-    let max_ki = config::ALLOWED_KEYS
+    let max_ki = cfg
+        .keys
+        .allowed
         .chars()
         .filter_map(char_to_key_index)
         .max()
@@ -65,12 +67,13 @@ pub fn smart_init(ctx: &OptContext) -> Vec<u8> {
 /// - (最佳分配, 最佳得分, 最佳指标, 最佳简码指标)
 pub fn simulated_annealing(
     ctx: &OptContext,
+    cfg: &Config,
     thread_id: usize,
 ) -> (Vec<u8>, f64, Metrics, SimpleMetrics) {
     let mut rng = thread_rng();
 
     // 智能初始化
-    let mut assignment = smart_init(ctx);
+    let mut assignment = smart_init(ctx, cfg);
     
     // 10% 概率随机扰动
     if rng.gen_bool(0.5) {
@@ -91,15 +94,15 @@ pub fn simulated_annealing(
     let mut best_metrics = evaluator.get_metrics(ctx);
     let mut best_simple_metrics = evaluator.get_simple_metrics(ctx);
 
-    let steps = config::TOTAL_STEPS;
+    let steps = cfg.annealing.total_steps;
 
     // 构建温度调度器
     let schedule = TemperatureSchedule::build(
-        config::TEMP_START,
-        config::TEMP_END,
-        config::COMFORT_TEMP,
-        config::COMFORT_WIDTH,
-        config::COMFORT_SLOWDOWN,
+        cfg.annealing.temp_start,
+        cfg.annealing.temp_end,
+        cfg.annealing.comfort_temp,
+        cfg.annealing.comfort_width,
+        cfg.annealing.comfort_slowdown,
     );
 
     // 主线程打印预览
@@ -109,8 +112,9 @@ pub fn simulated_annealing(
 
     // 重新加热参数
     let mut temp_multiplier = 1.0f64;
-    let reheat_decay = if config::MIN_IMPROVE_STEPS > 0 {
-        (0.01f64).powf(1.0 / config::MIN_IMPROVE_STEPS as f64)
+    let min_improve_steps = cfg.min_improve_steps();
+    let reheat_decay = if min_improve_steps > 0 {
+        (0.01f64).powf(1.0 / min_improve_steps as f64)
     } else {
         0.99
     };
@@ -129,6 +133,7 @@ pub fn simulated_annealing(
     }
 
     let report_interval = (steps / 20).max(1);
+    let perturb_interval = cfg.perturb_interval();
 
     // 主循环
     for step in 0..steps {
@@ -143,7 +148,7 @@ pub fn simulated_annealing(
         }
 
         // 选择操作：交换或移动
-        if rng.gen::<f64>() < config::SWAP_PROBABILITY && n_groups >= 2 {
+        if rng.gen::<f64>() < cfg.annealing.swap_probability && n_groups >= 2 {
             let r1 = rng.gen_range(0..n_groups);
             let r2 = rng.gen_range(0..n_groups - 1);
             let r2 = if r2 >= r1 { r2 + 1 } else { r2 };
@@ -189,15 +194,15 @@ pub fn simulated_annealing(
         }
 
         // 长时间无改进则重新加热
-        if steps_since_improve > config::MIN_IMPROVE_STEPS {
-            temp_multiplier = config::REHEAT_FACTOR;
+        if steps_since_improve > min_improve_steps {
+            temp_multiplier = cfg.annealing.reheat_factor;
             steps_since_improve = 0;
 
             if thread_id == 0 {
                 println!(
                     "   [T0] 步数 {}: Reheat ×{:.1} (基温 {:.6})",
                     step,
-                    config::REHEAT_FACTOR,
+                    cfg.annealing.reheat_factor,
                     base_temp
                 );
             }
@@ -205,10 +210,10 @@ pub fn simulated_annealing(
 
         // 低温扰动
         if step > 0
-            && step % config::PERTURB_INTERVAL == 0
-            && base_temp < config::COMFORT_TEMP * 0.01
+            && step % perturb_interval == 0
+            && base_temp < cfg.annealing.comfort_temp * 0.01
         {
-            let n_perturb = (n_groups as f64 * config::PERTURB_STRENGTH) as usize;
+            let n_perturb = (n_groups as f64 * cfg.annealing.perturb_strength) as usize;
             for _ in 0..n_perturb {
                 let r1 = rng.gen_range(0..n_groups);
                 let r2 = rng.gen_range(0..n_groups);

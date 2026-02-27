@@ -52,6 +52,47 @@ pub fn pow_base(base: usize, exp: usize) -> usize {
     result
 }
 
+/// 权重配置 - 用于得分计算
+#[derive(Clone, Copy, Debug)]
+pub struct WeightConfig {
+    // 全码权重
+    pub weight_collision_count: f64,
+    pub weight_collision_rate: f64,
+    pub weight_equivalence: f64,
+    pub weight_equiv_cv: f64,
+    pub weight_distribution: f64,
+    // 简码开关与主权重
+    pub enable_simple_code: bool,
+    pub weight_full_code: f64,
+    pub weight_simple_code: f64,
+    // 简码子权重
+    pub simple_weight_freq: f64,
+    pub simple_weight_equiv: f64,
+    pub simple_weight_dist: f64,
+    pub simple_weight_collision_count: f64,
+    pub simple_weight_collision_rate: f64,
+}
+
+impl Default for WeightConfig {
+    fn default() -> Self {
+        Self {
+            weight_collision_count: 0.07,
+            weight_collision_rate: 0.62,
+            weight_equivalence: 0.2,
+            weight_equiv_cv: 0.01,
+            weight_distribution: 0.1,
+            enable_simple_code: true,
+            weight_full_code: 0.7,
+            weight_simple_code: 0.3,
+            simple_weight_freq: 0.5,
+            simple_weight_equiv: 0.15,
+            simple_weight_dist: 0.05,
+            simple_weight_collision_count: 0.05,
+            simple_weight_collision_rate: 0.25,
+        }
+    }
+}
+
 /// 缩放配置 - 用于将不同量纲的指标归一化
 #[derive(Clone, Copy)]
 pub struct ScaleConfig {

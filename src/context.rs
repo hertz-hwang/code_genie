@@ -4,11 +4,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::config;
 use crate::types::{
     build_root_full_codes, CharInfo, CharSimpleInfo, compute_level_instructions,
     extract_logical_roots_full, try_resolve_rule, KeyDistConfig,
-    LogicalRoot, RootGroup, ScaleConfig, SimpleCodeConfig, KEY_SPACE, EQUIV_TABLE_SIZE,
+    LogicalRoot, RootGroup, ScaleConfig, SimpleCodeConfig, WeightConfig, KEY_SPACE, EQUIV_TABLE_SIZE,
     GROUP_MARKER,
 };
 
@@ -17,6 +16,10 @@ pub type EquivTable = [[f64; EQUIV_TABLE_SIZE]; EQUIV_TABLE_SIZE];
 
 /// 优化上下文 - 存储所有算法需要的数据
 pub struct OptContext {
+    /// 是否启用简码优化
+    pub enable_simple_code: bool,
+    /// 权重配置
+    pub weights: WeightConfig,
     /// 字根组数量
     pub num_groups: usize,
     /// 字根名到组索引的映射
@@ -65,7 +68,9 @@ impl OptContext {
         key_dist_config: [KeyDistConfig; EQUIV_TABLE_SIZE],
         scale_config: ScaleConfig,
         simple_config: SimpleCodeConfig,
+        weights: WeightConfig,
     ) -> Self {
+        let enable_simple_code = weights.enable_simple_code;
         let mut root_to_group: HashMap<String, usize> = HashMap::new();
         for (gi, g) in groups.iter().enumerate() {
             for r in &g.roots {
@@ -121,7 +126,7 @@ impl OptContext {
             let level_instructions =
                 compute_level_instructions(&logical_roots, &simple_config.levels);
 
-            if config::ENABLE_SIMPLE_CODE {
+            if enable_simple_code {
                 for level_cfg in &simple_config.levels {
                     for rule in &level_cfg.rule_candidates {
                         if let Some(instructions) =
@@ -154,6 +159,8 @@ impl OptContext {
         let code_space = crate::types::pow_base(code_base, max_parts);
 
         Self {
+            enable_simple_code,
+            weights,
             num_groups,
             root_to_group,
             group_to_chars,

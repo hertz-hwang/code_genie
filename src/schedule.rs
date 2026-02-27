@@ -2,8 +2,6 @@
 // 🌡️ 温度调度器
 // =========================================================================
 
-use crate::config;
-
 /// 查找表大小
 const SCHEDULE_LUT_SIZE: usize = 100_000;
 
@@ -13,6 +11,12 @@ pub struct TemperatureSchedule {
     lut: Vec<f64>,
     /// 舒适区进度位置
     comfort_progress: f64,
+    /// 配置参数（用于打印）
+    t_start: f64,
+    t_end: f64,
+    comfort_temp: f64,
+    comfort_width: f64,
+    comfort_slowdown: f64,
 }
 
 impl TemperatureSchedule {
@@ -58,6 +62,11 @@ impl TemperatureSchedule {
         Self {
             lut,
             comfort_progress: comfort_p,
+            t_start,
+            t_end,
+            comfort_temp,
+            comfort_width: width,
+            comfort_slowdown: slowdown,
         }
     }
 
@@ -81,20 +90,20 @@ impl TemperatureSchedule {
         println!("   🌡️ 降温曲线预览:");
         println!(
             "   舒适温度: {:.6} (进度 {:.1}% 处)",
-            config::COMFORT_TEMP,
+            self.comfort_temp,
             self.comfort_progress * 100.0
         );
         println!(
             "   舒适区宽度: {:.2}, 减速深度: {:.0}%",
-            config::COMFORT_WIDTH,
-            config::COMFORT_SLOWDOWN * 100.0
+            self.comfort_width,
+            self.comfort_slowdown * 100.0
         );
         println!("   ┌──────────────────────────────────────────────────────");
 
         let rows = 20;
         let bar_width = 50;
-        let log_start = config::TEMP_START.ln();
-        let log_end = config::TEMP_END.ln();
+        let log_start = self.t_start.ln();
+        let log_end = self.t_end.ln();
         let log_range = log_start - log_end;
 
         for i in 0..=rows {

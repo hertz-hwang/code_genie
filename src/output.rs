@@ -5,8 +5,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 
-use crate::config;
 use crate::context::OptContext;
+use crate::config::Config;
 use crate::evaluator::SimpleEvaluator;
 use crate::types::{extract_base_name, extract_suffix_num, key_to_char, Metrics, SimpleMetrics};
 
@@ -101,9 +101,102 @@ pub fn write_keymap_output(
     }
 }
 
+/// 保存简码+全码编码文件
+pub fn save_combined_code_output(ctx: &OptContext, assignment: &[u8], dir: &str) {
+    // 构建根名到键位的映射
+    let mut root_to_key: HashMap<String, u8> = HashMap::new();
+    for (root, &key) in &ctx.fixed_roots {
+        root_to_key.insert(root.clone(), key);
+    }
+    for (gi, group) in ctx.groups.iter().enumerate() {
+        let key = assignment[gi];
+        for root in &group.roots {
+            root_to_key.insert(root.clone(), key);
+        }
+    }
+
+    let mut out = String::new();
+    let mut simple_assigned: HashSet<usize> = HashSet::new();
+
+    // 按字频排序
+    let n_chars = ctx.char_infos.len();
+    let mut sorted_chars: Vec<usize> = (0..n_chars).collect();
+    sorted_chars.sort_by(|&a, &b| {
+        ctx.char_infos[b]
+            .frequency
+            .cmp(&ctx.char_infos[a].frequency)
+    });
+
+    // 简码部分 - 与 save_simple_code_output 完全相同的逻辑
+    for (li, level_cfg) in ctx.simple_config.levels.iter().enumerate() {
+        let mut code_candidates: HashMap<usize, Vec<(usize, u64)>> = HashMap::new();
+
+        for &ci in &sorted_chars {
+            if simple_assigned.contains(&ci) {
+                continue;
+            }
+            if let Some(code) = ctx.calc_simple_code(ci, li, assignment) {
+                code_candidates
+                    .entry(code)
+                    .or_default()
+                    .push((ci, ctx.char_infos[ci].frequency));
+            }
+        }
+
+        // 收集该级别所有获胜者
+        let mut level_winners: Vec<(usize, u64, String)> = Vec::new();
+
+        for (_code, candidates) in &code_candidates {
+            let mut count = 0;
+            for &(ci, freq) in candidates {
+                if count >= level_cfg.code_num {
+                    break;
+                }
+                if simple_assigned.contains(&ci) {
+                    continue;
+                }
+
+                let ch = ctx.raw_splits[ci].0;
+                let code_str: String = ctx
+                    .get_simple_keys(ci, li, assignment)
+                    .map(|keys| keys.iter().map(|&k| key_to_char(k)).collect())
+                    .unwrap_or_else(|| String::from("?"));
+
+                level_winners.push((ci, freq, format!("{}\t{}", ch, code_str)));
+                count += 1;
+            }
+        }
+
+        // 按字频排序输出
+        level_winners.sort_by(|a, b| b.1.cmp(&a.1));
+
+        for (ci, _, line) in &level_winners {
+            out.push_str(line);
+            out.push('\n');
+            simple_assigned.insert(*ci);
+        }
+    }
+
+    // 全码部分 - 所有字都输出全码
+    for &ci in &sorted_chars {
+        let ch = ctx.raw_splits[ci].0;
+        let (_, roots, _) = &ctx.raw_splits[ci];
+        let mut code_parts = Vec::new();
+        for root in roots {
+            if let Some(&key) = root_to_key.get(root) {
+                code_parts.push(key_to_char(key));
+            }
+        }
+        let code_str: String = code_parts.into_iter().collect();
+        out.push_str(&format!("{}\t{}\n", ch, code_str));
+    }
+
+    fs::write(format!("{}/output-combined.txt", dir), out).unwrap();
+}
+
 /// 保存简码输出
 pub fn save_simple_code_output(ctx: &OptContext, assignment: &[u8], dir: &str) {
-    if !config::ENABLE_SIMPLE_CODE || ctx.simple_config.levels.is_empty() {
+    if !ctx.enable_simple_code || ctx.simple_config.levels.is_empty() {
         return;
     }
 
@@ -239,7 +332,7 @@ pub fn save_thread_results(
         "# 用指分布偏差(L2): {:.4}\n",
         metrics.dist_deviation
     ));
-    if config::ENABLE_SIMPLE_CODE {
+    if ctx.enable_simple_code {
         root_out.push_str(&format!(
             "# 简码覆盖频率: {:.4}%\n",
             simple_metrics.weighted_freq_coverage * 100.0
@@ -302,17 +395,20 @@ pub fn save_thread_results(
     save_key_distribution_to_dir(ctx, assignment, &thread_dir);
     save_equiv_distribution_to_dir(ctx, assignment, &thread_dir);
     save_simple_code_output(ctx, assignment, &thread_dir);
+    save_combined_code_output(ctx, assignment, &thread_dir);
 }
 
 /// 保存键位分布到目录
 pub fn save_key_distribution_to_dir(ctx: &OptContext, assignment: &[u8], dir: &str) {
+    let display_order = &ctx.weights; // 从 ctx 获取显示顺序需要额外存储，暂时使用默认
     let evaluator = crate::evaluator::Evaluator::new(ctx, assignment);
     let mut out = String::new();
     out.push_str("# 用指分布统计\n");
-    out.push_str(&format!("# 排列顺序: {}\n", config::KEY_DISPLAY_ORDER));
     out.push_str("# 键位\t实际%\t目标%\t偏差\t偏差²\n");
 
-    for kc in config::KEY_DISPLAY_ORDER.chars() {
+    // 使用固定的显示顺序
+    let display_order = "qwertyuiopasdfghjklzxcvbnm";
+    for kc in display_order.chars() {
         if let Some(ki) = crate::types::char_to_key_index(kc) {
             if ki >= 31 {
                 continue;
@@ -331,7 +427,7 @@ pub fn save_key_distribution_to_dir(ctx: &OptContext, assignment: &[u8], dir: &s
         }
     }
 
-    let order_set: HashSet<char> = config::KEY_DISPLAY_ORDER.chars().collect();
+    let order_set: HashSet<char> = display_order.chars().collect();
     let special_keys = [('_', 26usize), (';', 27), (',', 28), ('.', 29), ('/', 30)];
     for (kc, ki) in &special_keys {
         if !order_set.contains(kc) && *ki < 31 {
@@ -418,7 +514,7 @@ pub fn save_results(
         "# 用指分布偏差(L2): {:.4}\n",
         metrics.dist_deviation
     ));
-    if config::ENABLE_SIMPLE_CODE {
+    if ctx.enable_simple_code {
         root_out.push_str(&format!(
             "# 简码覆盖频率: {:.4}%\n",
             simple_metrics.weighted_freq_coverage * 100.0
@@ -481,15 +577,17 @@ pub fn save_results(
     save_key_distribution_to_dir(ctx, assignment, output_dir);
     save_equiv_distribution_to_dir(ctx, assignment, output_dir);
     save_simple_code_output(ctx, assignment, output_dir);
+    save_combined_code_output(ctx, assignment, output_dir);
 
     println!(
-        "结果已保存至 {}/output-keymap.txt, output-encode.txt, output-simple-codes.txt 等",
+        "结果已保存至 {}/output-keymap.txt, output-encode.txt, output-simple-codes.txt, output-combined.txt 等",
         output_dir
     );
 }
 
 /// 保存汇总信息
 pub fn save_summary(
+    cfg: &Config,
     results: &[(usize, Vec<u8>, f64, Metrics, SimpleMetrics)],
     best_thread: usize,
     output_dir: &str,
@@ -498,14 +596,14 @@ pub fn save_summary(
     let mut summary = String::new();
     summary.push_str("# 优化结果汇总\n");
     summary.push_str(&format!("# 输出目录: {}\n", output_dir));
-    summary.push_str(&format!("# 线程数: {}\n", config::NUM_THREADS));
-    summary.push_str(&format!("# 总步数: {}\n", config::TOTAL_STEPS));
+    summary.push_str(&format!("# 线程数: {}\n", cfg.annealing.threads));
+    summary.push_str(&format!("# 总步数: {}\n", cfg.annealing.total_steps));
     summary.push_str(&format!("# 总耗时: {:?}\n", elapsed));
     summary.push_str(&format!("# 最优线程: {}\n", best_thread));
-    summary.push_str(&format!("# 简码优化: {}\n", config::ENABLE_SIMPLE_CODE));
+    summary.push_str(&format!("# 简码优化: {}\n", cfg.weights.simple_code.enabled));
     summary.push_str("#\n");
 
-    if config::ENABLE_SIMPLE_CODE {
+    if cfg.weights.simple_code.enabled {
         summary.push_str(&format!(
             "{:<8} {:<12} {:<10} {:<12} {:<10} {:<10} {:<12} {:<12} {:<10} {:<10} {:<10} {:<12}\n",
             "线程",
@@ -536,7 +634,7 @@ pub fn save_summary(
 
     for (tid, _, score, m, sm) in &sorted {
         let marker = if *tid == best_thread { " 🏆" } else { "" };
-        if config::ENABLE_SIMPLE_CODE {
+        if cfg.weights.simple_code.enabled {
             summary.push_str(&format!(
                 "T{:<7} {:<12.4} {:<10} {:<12.6} {:<10.4} {:<10.4} {:<12.4} {:<12.4} {:<10.4} {:<10.4} {:<10} {:<12.6}{}\n",
                 tid, score, m.collision_count, m.collision_rate * 100.0,

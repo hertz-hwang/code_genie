@@ -5,7 +5,6 @@
 use rand::prelude::*;
 use std::collections::{HashMap, HashSet};
 
-use crate::config;
 use crate::context::OptContext;
 use crate::types::{KeyDistConfig, Metrics, SimpleMetrics, EQUIV_TABLE_SIZE, GROUP_MARKER};
 
@@ -275,11 +274,11 @@ impl SimpleEvaluator {
             sm.collision_count as f64 * ctx.scale_config.simple_collision_count;
         let collision_rate_loss = sm.collision_rate * ctx.scale_config.simple_collision_rate;
 
-        config::SIMPLE_WEIGHT_FREQ * freq_loss
-            + config::SIMPLE_WEIGHT_EQUIV * equiv_loss
-            + config::SIMPLE_WEIGHT_DIST * dist_loss
-            + config::SIMPLE_WEIGHT_COLLISION_COUNT * collision_count_loss
-            + config::SIMPLE_WEIGHT_COLLISION_RATE * collision_rate_loss
+        ctx.weights.simple_weight_freq * freq_loss
+            + ctx.weights.simple_weight_equiv * equiv_loss
+            + ctx.weights.simple_weight_dist * dist_loss
+            + ctx.weights.simple_weight_collision_count * collision_count_loss
+            + ctx.weights.simple_weight_collision_rate * collision_rate_loss
     }
 
     /// 获取简码得分
@@ -451,7 +450,7 @@ impl Evaluator {
             0.0
         };
 
-        let simple_eval = if config::ENABLE_SIMPLE_CODE && !ctx.simple_config.levels.is_empty() {
+        let simple_eval = if ctx.enable_simple_code && !ctx.simple_config.levels.is_empty() {
             Some(SimpleEvaluator::new(ctx, assignment, &code_to_chars))
         } else {
             None
@@ -566,11 +565,11 @@ impl Evaluator {
             dist_deviation * ctx.scale_config.distribution,
         );
 
-        config::WEIGHT_COLLISION_COUNT * scaled.0
-            + config::WEIGHT_COLLISION_RATE * scaled.1
-            + config::WEIGHT_EQUIVALENCE * scaled.2
-            + config::WEIGHT_EQUIV_CV * scaled.3
-            + config::WEIGHT_DISTRIBUTION * scaled.4
+        ctx.weights.weight_collision_count * scaled.0
+            + ctx.weights.weight_collision_rate * scaled.1
+            + ctx.weights.weight_equivalence * scaled.2
+            + ctx.weights.weight_equiv_cv * scaled.3
+            + ctx.weights.weight_distribution * scaled.4
     }
 
     /// 计算综合得分
@@ -578,10 +577,10 @@ impl Evaluator {
     pub fn compute_score(&self, ctx: &OptContext) -> f64 {
         let full_score = self.compute_full_score(ctx);
 
-        if config::ENABLE_SIMPLE_CODE {
+        if ctx.enable_simple_code {
             if let Some(ref se) = self.simple_eval {
                 let simple_score = se.cached_simple_score;
-                config::WEIGHT_FULL_CODE * full_score + config::WEIGHT_SIMPLE_CODE * simple_score
+                ctx.weights.weight_full_code * full_score + ctx.weights.weight_simple_code * simple_score
             } else {
                 full_score
             }
@@ -657,7 +656,7 @@ impl Evaluator {
 
     /// 检查是否有简码影响
     pub fn has_simple_impact(&self, ctx: &OptContext, group: usize) -> bool {
-        if !config::ENABLE_SIMPLE_CODE || self.simple_eval.is_none() {
+        if !ctx.enable_simple_code || self.simple_eval.is_none() {
             return false;
         }
         !ctx.group_to_simple_affected[group].is_empty()

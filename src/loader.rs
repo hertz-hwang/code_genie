@@ -5,7 +5,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 
-use crate::config;
 use crate::types::{char_to_key_index, KeyDistConfig, RootGroup, KEY_SPACE};
 
 /// 加载固定字根和受限字根组
@@ -54,8 +53,8 @@ pub fn load_fixed(path: &str) -> (HashMap<String, u8>, Vec<RootGroup>) {
 }
 
 /// 加载动态字根组
-pub fn load_dynamic(path: &str, constrained: &[RootGroup]) -> Vec<RootGroup> {
-    let global_allowed: Vec<u8> = config::ALLOWED_KEYS
+pub fn load_dynamic(path: &str, constrained: &[RootGroup], allowed_keys: &str) -> Vec<RootGroup> {
+    let global_allowed: Vec<u8> = allowed_keys
         .chars()
         .filter_map(char_to_key_index)
         .map(|i| i as u8)
