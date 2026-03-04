@@ -26,43 +26,43 @@ display_order = "qwertyuiopasdfghjklzxcvbnm"
 # -------------------------------------------------------------------------
 [weights.full_code]
 # 全码部分权重（总和应为 1.0）
-collision_count = 0.07   # 重码数权重
-collision_rate = 0.62    # 重码率权重
-equivalence = 0.2        # 当量权重
-equiv_cv = 0.01          # 当量变异系数权重
-distribution = 0.1       # 分布偏差权重
+collision_count = 1.0    # 重码数权重
+collision_rate = 0.0     # 重码率权重
+equivalence = 0.0        # 当量权重
+equiv_cv = 0.0           # 当量变异系数权重
+distribution = 0.0       # 分布偏差权重
 
 [weights.simple_code]
 # 简码优化开关与权重
-enabled = true           # 是否启用简码优化
-full_code_weight = 0.4   # 全码目标总权重
-simple_code_weight = 0.6 # 简码目标总权重
+enabled = false           # 是否启用简码优化
+full_code_weight = 1.0   # 全码目标总权重
+simple_code_weight = 0.0 # 简码目标总权重
 
 # 简码内部子权重（总和应为 1.0）
-freq = 0.5               # 频率覆盖权重
-equiv = 0.15             # 当量权重
-dist = 0.05              # 分布偏差权重
-collision_count = 0.05   # 重码数权重
-collision_rate = 0.25    # 重码率权重
+freq = 0.0               # 频率覆盖权重
+equiv = 0.0              # 当量权重
+dist = 0.0               # 分布偏差权重
+collision_count = 0.0    # 重码数权重
+collision_rate = 0.0     # 重码率权重
 
 # -------------------------------------------------------------------------
 # 🌡️ 模拟退火参数
 # -------------------------------------------------------------------------
 [annealing]
-threads = 8              # 并行线程数
-total_steps = 10000     # 总迭代步数
+threads = 16             # 并行线程数
+total_steps = 100000000     # 总迭代步数
 temp_start = 1.0         # 初始温度
 temp_end = 0.000001      # 结束温度
 comfort_temp = 0.2       # 舒适温度区间
 comfort_width = 0.15     # 舒适区宽度
-comfort_slowdown = 0.8   # 舒适区减速因子
-swap_probability = 0.3   # 交换操作概率
+comfort_slowdown = 0.7   # 舒适区减速因子
+swap_probability = 0.6   # 交换操作概率
 
 # 以下参数基于 total_steps 的比例计算
 min_improve_steps_ratio = 0.1    # 最小改进步数比例 (total_steps / 10)
 perturb_interval_ratio = 0.05    # 扰动间隔比例 (total_steps / 20)
 perturb_strength = 0.15          # 扰动强度
-reheat_factor = 1.25             # 重新加热因子
+reheat_factor = 1.15             # 重新加热因子
 max_parts = 3                    # 最大码长
 
 # -------------------------------------------------------------------------
@@ -82,12 +82,12 @@ max_parts = 3                    # 最大码长
 
 [[simple_levels]]
 level = 1
-code_num = 1             # 一级简码：每键0字
+code_num = 0             # 一级简码：每键0字
 rules = ["Aa"]           # 取首根第1码
 
 [[simple_levels]]
 level = 2
-code_num = 1             # 二级简码：每键1字
+code_num = 0             # 二级简码：每键1字
 rules = ["AaBa"]         # 取首根第1码 + 末根末码
 
 [[simple_levels]]

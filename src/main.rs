@@ -592,7 +592,7 @@ fn build_evaluate_report(
 
 fn run_optimize(cfg: &Config) {
     let start_time = Instant::now();
-    println!("=== CodeGenie 字劫算法优化器 v10 ===");
+    println!("=== CodeGenie 码灵算法优化器 v10 ===");
 
     // 验证配置
     cfg.validate_weights();
