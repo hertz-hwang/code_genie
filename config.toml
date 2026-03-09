@@ -49,14 +49,14 @@ collision_rate = 0.0     # 重码率权重
 # 🌡️ 模拟退火参数
 # -------------------------------------------------------------------------
 [annealing]
-threads = 16             # 并行线程数
-total_steps = 100000000     # 总迭代步数
+threads = 8             # 并行线程数
+total_steps = 50000000     # 总迭代步数
 temp_start = 1.0         # 初始温度
 temp_end = 0.000001      # 结束温度
 comfort_temp = 0.2       # 舒适温度区间
 comfort_width = 0.15     # 舒适区宽度
 comfort_slowdown = 0.7   # 舒适区减速因子
-swap_probability = 0.6   # 交换操作概率
+swap_probability = 0.35   # 交换操作概率
 
 # 以下参数基于 total_steps 的比例计算
 min_improve_steps_ratio = 0.1    # 最小改进步数比例 (total_steps / 10)
