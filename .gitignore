@@ -1,7 +1,7 @@
 **/.DS_Store
 **/examples
 **/target
-**/output-*
+**/output*
 **/missing-*
 **/tmp
 **/plans

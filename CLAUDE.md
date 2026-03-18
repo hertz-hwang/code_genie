@@ -56,8 +56,8 @@ cargo check
 
 ### 关键数据结构
 
-- **OptContext**: 优化上下文，包含 `groups`（字根组）、`chars`（汉字信息）、`group_to_chars`（反向索引）、`equiv_table`（当量矩阵）、`simple_config`、`char_simple_info`（逻辑根+级别指令）、`group_to_simple_affected` 等
-- **Evaluator**: 维护 `code_to_chars` 碰撞桶、`key_weighted_usage` 键位使用统计，支持增量 move/swap 操作和 Boltzmann 接受判定
+- **OptContext**: 优化上下文，包含 `groups`（字根组）、`chars`（汉字信息）、`group_to_chars`（反向索引）、`equiv_table`（当量矩阵）、`simple_config`、`char_simple_info`（逻辑根+级别指令）、`group_to_simple_affected`、`group_freq_sum`（预计算的组加权频率，用于 O(1) 键位使用量更新）等
+- **Evaluator**: 维护 `code_to_chars` 碰撞桶（Vec 直接索引，大小 = code_space）、`char_bucket_pos`（桶内位置索引）、`bucket_freq_sum`/`bucket_max_freq`（桶频率统计）、`key_weighted_usage` 键位使用统计，支持增量 move/swap 操作和 Boltzmann 接受判定
 - **SimpleEvaluator**: 按级别跟踪简码分配，计算简码重码数/率、频率覆盖、当量、分布
 - **RootGroup**: 字根组，包含 `roots`（字根名列表）和 `allowed_keys`（允许分配的键位）
 - **CharInfo**: 汉字拆分信息，`parts: Vec<u16>` 中值 < 1000 为直接键位索引，>= 1000 为组标记（GROUP_MARKER + group_index）
@@ -171,6 +171,11 @@ rules = ["AaAbZz", "AaBaZz"]  # 多候选规则
 
 - 使用 `rayon` 并行执行多线程模拟退火（每线程独立 SA 实例）
 - `Evaluator` 支持增量更新（move/swap 只重算受影响的汉字），避免全量重算
+- 碰撞桶使用 `Vec<Vec<usize>>` 直接索引替代 `HashMap`，配合 `char_bucket_pos` 实现 O(1) swap_remove
+- `bucket_freq_sum`/`bucket_max_freq` 实现碰撞频率的增量维护，避免每次遍历桶
+- `group_freq_sum` 预计算组加权频率，`key_weighted_usage` 更新从 O(chars) 降为 O(1)
+- `try_triple_swap` 和 `coordinate_descent` 改为增量评估+回滚，不再重建 Evaluator
+- SA 主循环输出实时速度统计（万步/分钟）
 - 温度调度使用预计算查找表 (LUT, 100001 个采样点 + 线性插值)
 - Release 编译启用 `opt-level=3`、LTO、单代码单元、`panic=abort`
 - `calibrate_scales` 自动校准使各指标在初始状态贡献均衡

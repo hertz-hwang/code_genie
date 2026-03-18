@@ -56,6 +56,8 @@ pub struct OptContext {
     pub group_to_simple_affected: Vec<HashSet<usize>>,
     /// 根名的完整编码映射
     pub root_full_codes: HashMap<String, Vec<String>>,
+    /// 每个组的加权频率总和（用于 key_weighted_usage 的 O(1) 更新）
+    pub group_freq_sum: Vec<f64>,
 }
 
 impl OptContext {
@@ -158,6 +160,19 @@ impl OptContext {
         let code_base = EQUIV_TABLE_SIZE + 1;
         let code_space = crate::types::pow_base(code_base, max_parts);
 
+        // 预计算每个组的加权频率总和
+        // group_freq_sum[r] = sum of freq_f for each (ci, part) where part references group r
+        let mut group_freq_sum = vec![0.0f64; num_groups];
+        for ci in 0..char_infos.len() {
+            let freq_f = char_infos[ci].frequency as f64;
+            for &p in &char_infos[ci].parts {
+                if p >= GROUP_MARKER {
+                    let gi = (p - GROUP_MARKER) as usize;
+                    group_freq_sum[gi] += freq_f;
+                }
+            }
+        }
+
         Self {
             enable_simple_code,
             weights,
@@ -179,6 +194,7 @@ impl OptContext {
             char_simple_infos,
             group_to_simple_affected,
             root_full_codes,
+            group_freq_sum,
         }
     }
 

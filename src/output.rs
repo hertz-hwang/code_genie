@@ -202,10 +202,11 @@ pub fn save_simple_code_output(ctx: &OptContext, assignment: &[u8], dir: &str) {
 
     // 构建全码到汉字的映射
     let n = ctx.char_infos.len();
-    let mut full_code_to_chars: HashMap<usize, Vec<usize>> = HashMap::new();
+    let cs = ctx.code_space;
+    let mut full_code_to_chars: Vec<Vec<usize>> = vec![Vec::new(); cs];
     for ci in 0..n {
         let code = ctx.calc_code_only(ci, assignment);
-        full_code_to_chars.entry(code).or_default().push(ci);
+        full_code_to_chars[code].push(ci);
     }
 
     let se = SimpleEvaluator::new(ctx, assignment, &full_code_to_chars);

@@ -6,7 +6,7 @@ use rand::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 use crate::context::OptContext;
-use crate::types::{KeyDistConfig, Metrics, SimpleMetrics, EQUIV_TABLE_SIZE, GROUP_MARKER};
+use crate::types::{KeyDistConfig, Metrics, SimpleMetrics, EQUIV_TABLE_SIZE};
 
 // =========================================================================
 // 简码评估器
@@ -53,7 +53,7 @@ impl SimpleEvaluator {
     pub fn new(
         ctx: &OptContext,
         assignment: &[u8],
-        full_code_to_chars: &HashMap<usize, Vec<usize>>,
+        full_code_to_chars: &[Vec<usize>],
     ) -> Self {
         let n_levels = ctx.simple_config.levels.len();
 
@@ -180,13 +180,16 @@ impl SimpleEvaluator {
     /// 遍历全码桶，去掉已出简的字，统计剩余重码
     fn compute_simple_collisions(
         ctx: &OptContext,
-        full_code_to_chars: &HashMap<usize, Vec<usize>>,
+        full_code_to_chars: &[Vec<usize>],
         assigned: &HashSet<usize>,
     ) -> (usize, f64) {
         let mut total_collision_count: usize = 0;
         let mut total_collision_freq: u64 = 0;
 
-        for chars in full_code_to_chars.values() {
+        for chars in full_code_to_chars.iter() {
+            if chars.is_empty() {
+                continue;
+            }
             // 过滤掉已出简的字
             let remaining: Vec<usize> = chars
                 .iter()
@@ -226,7 +229,7 @@ impl SimpleEvaluator {
         &mut self,
         ctx: &OptContext,
         assignment: &[u8],
-        full_code_to_chars: &HashMap<usize, Vec<usize>>,
+        full_code_to_chars: &[Vec<usize>],
     ) {
         let n_chars = ctx.char_infos.len();
         let n_levels = ctx.simple_config.levels.len();
@@ -361,8 +364,15 @@ pub struct Evaluator {
     current_codes: Vec<usize>,
     /// 当前等价值列表
     current_equiv_val: Vec<f64>,
-    /// 编码到汉字的映射
-    code_to_chars: HashMap<usize, Vec<usize>>,
+    /// 编码到汉字的映射（直接索引，大小 = code_space）
+    code_to_chars: Vec<Vec<usize>>,
+    /// 每个汉字在其桶中的位置（用于 O(1) swap_remove）
+    char_bucket_pos: Vec<usize>,
+    /// 每个桶的频率总和
+    bucket_freq_sum: Vec<u64>,
+    /// 每个桶的最大频率（用于增量 collision_freq 计算）
+    /// 注意：swap_remove 后 max 可能失效，需要重扫。用 second_max 优化常见情况。
+    bucket_max_freq: Vec<u64>,
 
     /// 总重码数
     total_collisions: usize,
@@ -387,9 +397,9 @@ pub struct Evaluator {
     pub inv_total_key_presses: f64,
 
     /// 缓存的得分
-    cached_score: f64,
+    pub cached_score: f64,
     /// 得分是否需要重新计算
-    score_dirty: bool,
+    pub score_dirty: bool,
 
     /// 简码评估器
     simple_eval: Option<SimpleEvaluator>,
@@ -399,7 +409,11 @@ impl Evaluator {
     /// 创建新的评估器
     pub fn new(ctx: &OptContext, assignment: &[u8]) -> Self {
         let n = ctx.char_infos.len();
-        let mut code_to_chars: HashMap<usize, Vec<usize>> = HashMap::new();
+        let cs = ctx.code_space;
+        let mut code_to_chars: Vec<Vec<usize>> = vec![Vec::new(); cs];
+        let mut char_bucket_pos = vec![0usize; n];
+        let mut bucket_freq_sum = vec![0u64; cs];
+        let mut bucket_max_freq = vec![0u64; cs];
         let mut current_codes = Vec::with_capacity(n);
         let mut current_equiv_val = Vec::with_capacity(n);
 
@@ -417,7 +431,14 @@ impl Evaluator {
 
             current_codes.push(code);
             current_equiv_val.push(equiv);
-            code_to_chars.entry(code).or_default().push(ci);
+
+            let pos = code_to_chars[code].len();
+            code_to_chars[code].push(ci);
+            char_bucket_pos[ci] = pos;
+            bucket_freq_sum[code] += info.frequency;
+            if info.frequency > bucket_max_freq[code] {
+                bucket_max_freq[code] = info.frequency;
+            }
 
             total_equiv_weighted += equiv * freq_f;
             total_equiv_sq_weighted += equiv * equiv * freq_f;
@@ -431,11 +452,11 @@ impl Evaluator {
 
         let mut total_collisions = 0usize;
         let mut collision_frequency = 0u64;
-        for chars in code_to_chars.values() {
-            let cnt = chars.len();
+        for code in 0..cs {
+            let cnt = code_to_chars[code].len();
             if cnt >= 2 {
                 total_collisions += cnt - 1;
-                collision_frequency += Self::bucket_cf(ctx, chars);
+                collision_frequency += bucket_freq_sum[code] - bucket_max_freq[code];
             }
         }
 
@@ -460,6 +481,9 @@ impl Evaluator {
             current_codes,
             current_equiv_val,
             code_to_chars,
+            char_bucket_pos,
+            bucket_freq_sum,
+            bucket_max_freq,
             total_collisions,
             collision_frequency,
             total_equiv_weighted,
@@ -478,9 +502,22 @@ impl Evaluator {
         e
     }
 
-    /// 计算桶的重码频率
+    /// 重新扫描桶的最大频率
     #[inline]
-    fn bucket_cf(ctx: &OptContext, chars: &[usize]) -> u64 {
+    fn rescan_bucket_max(&self, ctx: &OptContext, code: usize) -> u64 {
+        let mut max_f = 0u64;
+        for &ci in &self.code_to_chars[code] {
+            let f = ctx.char_infos[ci].frequency;
+            if f > max_f {
+                max_f = f;
+            }
+        }
+        max_f
+    }
+
+    /// 计算桶的重码频率（仅用于 SimpleEvaluator 等非热路径）
+    #[inline]
+    fn bucket_cf_static(ctx: &OptContext, chars: &[usize]) -> u64 {
         debug_assert!(chars.len() >= 2);
         let mut total = 0u64;
         let mut max_f = 0u64;
@@ -494,7 +531,7 @@ impl Evaluator {
         total - max_f
     }
 
-    /// 更新单个汉字的编码
+    /// 更新单个汉字的编码（增量更新碰撞计数）
     #[inline]
     pub fn update_char(&mut self, ctx: &OptContext, assignment: &[u8], ci: usize) {
         let old_code = self.current_codes[ci];
@@ -503,49 +540,85 @@ impl Evaluator {
             return;
         }
 
-        let freq_f = ctx.char_infos[ci].frequency as f64;
+        let freq = ctx.char_infos[ci].frequency;
+        let freq_f = freq as f64;
 
+        // 更新等价值
         let old_eq = self.current_equiv_val[ci];
         let new_eq = ctx.calc_equiv_from_parts(ci, assignment);
         self.total_equiv_weighted += (new_eq - old_eq) * freq_f;
         self.total_equiv_sq_weighted += (new_eq * new_eq - old_eq * old_eq) * freq_f;
         self.current_equiv_val[ci] = new_eq;
 
-        let (dcc1, dcf1, old_empty) = {
-            let b = self.code_to_chars.get_mut(&old_code).unwrap();
-            let n = b.len();
-            let cc0 = n.saturating_sub(1);
-            let cf0 = if n >= 2 { Self::bucket_cf(ctx, b) } else { 0 };
-            if let Some(pos) = b.iter().position(|&c| c == ci) {
-                b.swap_remove(pos);
-            }
-            let m = b.len();
-            let cc1 = m.saturating_sub(1);
-            let cf1 = if m >= 2 { Self::bucket_cf(ctx, b) } else { 0 };
-            (
-                cc1 as isize - cc0 as isize,
-                cf1 as i64 - cf0 as i64,
-                b.is_empty(),
-            )
+        // === 从旧桶移除 ===
+        let old_len = self.code_to_chars[old_code].len();
+        // 旧桶的碰撞贡献（移除前）
+        let old_bucket_cc = old_len.saturating_sub(1);
+        let old_bucket_cf = if old_len >= 2 {
+            self.bucket_freq_sum[old_code] - self.bucket_max_freq[old_code]
+        } else {
+            0
         };
-        if old_empty {
-            self.code_to_chars.remove(&old_code);
+
+        // swap_remove: 用最后一个元素替换被移除的元素
+        let pos = self.char_bucket_pos[ci];
+        let last_idx = old_len - 1;
+        if pos != last_idx {
+            let moved_ci = self.code_to_chars[old_code][last_idx];
+            self.code_to_chars[old_code][pos] = moved_ci;
+            self.char_bucket_pos[moved_ci] = pos;
+        }
+        self.code_to_chars[old_code].pop();
+
+        // 更新旧桶的频率统计
+        self.bucket_freq_sum[old_code] -= freq;
+        // 如果移除的是 max，需要重扫
+        if freq >= self.bucket_max_freq[old_code] {
+            self.bucket_max_freq[old_code] = if self.code_to_chars[old_code].is_empty() {
+                0
+            } else {
+                self.rescan_bucket_max(ctx, old_code)
+            };
         }
 
-        let (dcc2, dcf2) = {
-            let b = self.code_to_chars.entry(new_code).or_default();
-            let n = b.len();
-            let cc0 = n.saturating_sub(1);
-            let cf0 = if n >= 2 { Self::bucket_cf(ctx, b) } else { 0 };
-            b.push(ci);
-            let m = b.len();
-            let cc1 = m.saturating_sub(1);
-            let cf1 = if m >= 2 { Self::bucket_cf(ctx, b) } else { 0 };
-            (cc1 as isize - cc0 as isize, cf1 as i64 - cf0 as i64)
+        let new_old_len = self.code_to_chars[old_code].len();
+        let new_old_cc = new_old_len.saturating_sub(1);
+        let new_old_cf = if new_old_len >= 2 {
+            self.bucket_freq_sum[old_code] - self.bucket_max_freq[old_code]
+        } else {
+            0
         };
 
-        self.total_collisions = (self.total_collisions as isize + dcc1 + dcc2) as usize;
-        self.collision_frequency = (self.collision_frequency as i64 + dcf1 + dcf2) as u64;
+        // === 插入新桶 ===
+        let new_len = self.code_to_chars[new_code].len();
+        let new_bucket_cc = new_len.saturating_sub(1);
+        let new_bucket_cf = if new_len >= 2 {
+            self.bucket_freq_sum[new_code] - self.bucket_max_freq[new_code]
+        } else {
+            0
+        };
+
+        let new_pos = new_len;
+        self.code_to_chars[new_code].push(ci);
+        self.char_bucket_pos[ci] = new_pos;
+        self.bucket_freq_sum[new_code] += freq;
+        if freq > self.bucket_max_freq[new_code] {
+            self.bucket_max_freq[new_code] = freq;
+        }
+
+        let after_new_len = new_len + 1;
+        let after_new_cc = after_new_len.saturating_sub(1);
+        let after_new_cf = if after_new_len >= 2 {
+            self.bucket_freq_sum[new_code] - self.bucket_max_freq[new_code]
+        } else {
+            0
+        };
+
+        // 更新全局碰撞计数
+        self.total_collisions = (self.total_collisions + new_old_cc + after_new_cc)
+            - (old_bucket_cc + new_bucket_cc);
+        self.collision_frequency = (self.collision_frequency + new_old_cf + after_new_cf)
+            - (old_bucket_cf + new_bucket_cf);
         self.current_codes[ci] = new_code;
     }
 
@@ -690,15 +763,10 @@ impl Evaluator {
         let old_score = self.get_score(ctx);
         let needs_simple = self.has_simple_impact(ctx, r);
 
-        for &ci in &ctx.group_to_chars[r] {
-            let freq_f = ctx.char_infos[ci].frequency as f64;
-            for &p in &ctx.char_infos[ci].parts {
-                if p >= GROUP_MARKER && (p - GROUP_MARKER) as usize == r {
-                    self.key_weighted_usage[old_key as usize] -= freq_f;
-                    self.key_weighted_usage[new_key as usize] += freq_f;
-                }
-            }
-        }
+        // O(1) key_weighted_usage 更新
+        let gfs = ctx.group_freq_sum[r];
+        self.key_weighted_usage[old_key as usize] -= gfs;
+        self.key_weighted_usage[new_key as usize] += gfs;
 
         assignment[r] = new_key;
         for &ci in &ctx.group_to_chars[r] {
@@ -716,16 +784,9 @@ impl Evaluator {
         if delta <= 0.0 || rng.gen::<f64>() < (-delta / temp).exp() {
             true
         } else {
-            // 回滚
-            for &ci in &ctx.group_to_chars[r] {
-                let freq_f = ctx.char_infos[ci].frequency as f64;
-                for &p in &ctx.char_infos[ci].parts {
-                    if p >= GROUP_MARKER && (p - GROUP_MARKER) as usize == r {
-                        self.key_weighted_usage[new_key as usize] -= freq_f;
-                        self.key_weighted_usage[old_key as usize] += freq_f;
-                    }
-                }
-            }
+            // 回滚 key_weighted_usage
+            self.key_weighted_usage[new_key as usize] -= gfs;
+            self.key_weighted_usage[old_key as usize] += gfs;
 
             assignment[r] = old_key;
             for &ci in &ctx.group_to_chars[r] {
@@ -762,24 +823,13 @@ impl Evaluator {
         let old_score = self.get_score(ctx);
         let needs_simple = self.has_simple_impact(ctx, r1) || self.has_simple_impact(ctx, r2);
 
-        for &ci in &ctx.group_to_chars[r1] {
-            let freq_f = ctx.char_infos[ci].frequency as f64;
-            for &p in &ctx.char_infos[ci].parts {
-                if p >= GROUP_MARKER && (p - GROUP_MARKER) as usize == r1 {
-                    self.key_weighted_usage[k1 as usize] -= freq_f;
-                    self.key_weighted_usage[k2 as usize] += freq_f;
-                }
-            }
-        }
-        for &ci in &ctx.group_to_chars[r2] {
-            let freq_f = ctx.char_infos[ci].frequency as f64;
-            for &p in &ctx.char_infos[ci].parts {
-                if p >= GROUP_MARKER && (p - GROUP_MARKER) as usize == r2 {
-                    self.key_weighted_usage[k2 as usize] -= freq_f;
-                    self.key_weighted_usage[k1 as usize] += freq_f;
-                }
-            }
-        }
+        // O(1) key_weighted_usage 更新
+        let gfs1 = ctx.group_freq_sum[r1];
+        let gfs2 = ctx.group_freq_sum[r2];
+        self.key_weighted_usage[k1 as usize] -= gfs1;
+        self.key_weighted_usage[k2 as usize] += gfs1;
+        self.key_weighted_usage[k2 as usize] -= gfs2;
+        self.key_weighted_usage[k1 as usize] += gfs2;
 
         assignment[r1] = k2;
         assignment[r2] = k1;
@@ -801,25 +851,11 @@ impl Evaluator {
         if delta <= 0.0 || rng.gen::<f64>() < (-delta / temp).exp() {
             true
         } else {
-            // 回滚
-            for &ci in &ctx.group_to_chars[r1] {
-                let freq_f = ctx.char_infos[ci].frequency as f64;
-                for &p in &ctx.char_infos[ci].parts {
-                    if p >= GROUP_MARKER && (p - GROUP_MARKER) as usize == r1 {
-                        self.key_weighted_usage[k2 as usize] -= freq_f;
-                        self.key_weighted_usage[k1 as usize] += freq_f;
-                    }
-                }
-            }
-            for &ci in &ctx.group_to_chars[r2] {
-                let freq_f = ctx.char_infos[ci].frequency as f64;
-                for &p in &ctx.char_infos[ci].parts {
-                    if p >= GROUP_MARKER && (p - GROUP_MARKER) as usize == r2 {
-                        self.key_weighted_usage[k1 as usize] -= freq_f;
-                        self.key_weighted_usage[k2 as usize] += freq_f;
-                    }
-                }
-            }
+            // 回滚 key_weighted_usage
+            self.key_weighted_usage[k2 as usize] -= gfs1;
+            self.key_weighted_usage[k1 as usize] += gfs1;
+            self.key_weighted_usage[k1 as usize] -= gfs2;
+            self.key_weighted_usage[k2 as usize] += gfs2;
 
             assignment[r1] = k1;
             assignment[r2] = k2;

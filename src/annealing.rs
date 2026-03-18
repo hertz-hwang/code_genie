@@ -4,12 +4,13 @@
 
 use rand::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use crate::config::Config;
 use crate::context::OptContext;
 use crate::evaluator::Evaluator;
 use crate::schedule::TemperatureSchedule;
-use crate::types::{char_to_key_index, Metrics, SimpleMetrics, KEY_SPACE};
+use crate::types::{char_to_key_index, Metrics, SimpleMetrics, GROUP_MARKER, KEY_SPACE};
 
 // =========================================================================
 // 初始化策略
@@ -173,8 +174,8 @@ fn find_collision_groups(
         for &ci in chars {
             let info = &ctx.char_infos[ci];
             for &p in &info.parts {
-                if p >= crate::types::GROUP_MARKER {
-                    let gi = (p - crate::types::GROUP_MARKER) as usize;
+                if p >= GROUP_MARKER {
+                    let gi = (p - GROUP_MARKER) as usize;
                     groups_in_conflict.insert(gi);
                 }
             }
@@ -281,7 +282,7 @@ fn try_key_reorganization(
     evaluator.try_move(ctx, assignment, gi, new_key, temp, rng)
 }
 
-/// 三组循环交换
+/// 三组循环交换 (g1←k2, g2←k3, g3←k1) — 增量评估
 fn try_triple_swap(
     ctx: &OptContext,
     assignment: &mut [u8],
@@ -302,42 +303,97 @@ fn try_triple_swap(
     let [g1, g2, g3] = [indices[0], indices[1], indices[2]];
     let [k1, k2, k3] = [assignment[g1], assignment[g2], assignment[g3]];
 
-    let can_12 = ctx.groups[g1].allowed_keys.contains(&k2)
-        && ctx.groups[g2].allowed_keys.contains(&k1);
-    let can_23 = ctx.groups[g2].allowed_keys.contains(&k3)
-        && ctx.groups[g3].allowed_keys.contains(&k2);
-    let can_31 = ctx.groups[g3].allowed_keys.contains(&k1)
-        && ctx.groups[g1].allowed_keys.contains(&k3);
+    // 三个键都相同则无意义
+    if k1 == k2 && k2 == k3 {
+        return false;
+    }
 
-    if !can_12 || !can_23 || !can_31 {
+    // 检查循环交换的合法性: g1→k2, g2→k3, g3→k1
+    if !ctx.groups[g1].allowed_keys.contains(&k2)
+        || !ctx.groups[g2].allowed_keys.contains(&k3)
+        || !ctx.groups[g3].allowed_keys.contains(&k1)
+    {
         return false;
     }
 
     let old_score = evaluator.get_score(ctx);
+    let needs_simple = evaluator.has_simple_impact(ctx, g1)
+        || evaluator.has_simple_impact(ctx, g2)
+        || evaluator.has_simple_impact(ctx, g3);
 
+    // 更新 key_weighted_usage
+    for &(gi, old_k, new_k) in &[(g1, k1, k2), (g2, k2, k3), (g3, k3, k1)] {
+        if old_k == new_k {
+            continue;
+        }
+        for &ci in &ctx.group_to_chars[gi] {
+            let freq_f = ctx.char_infos[ci].frequency as f64;
+            for &p in &ctx.char_infos[ci].parts {
+                if p >= GROUP_MARKER && (p - GROUP_MARKER) as usize == gi {
+                    evaluator.key_weighted_usage[old_k as usize] -= freq_f;
+                    evaluator.key_weighted_usage[new_k as usize] += freq_f;
+                }
+            }
+        }
+    }
+
+    // 执行交换
     assignment[g1] = k2;
     assignment[g2] = k3;
     assignment[g3] = k1;
 
+    // 增量更新受影响的汉字编码
     for &gi in &[g1, g2, g3] {
         for &ci in &ctx.group_to_chars[gi] {
             evaluator.update_char(ctx, assignment, ci);
         }
     }
 
-    let new_score = {
-        let mut eval = Evaluator::new(ctx, &assignment);
-        eval.get_score(ctx)
-    };
+    if needs_simple {
+        evaluator.rebuild_simple(ctx, assignment);
+    }
+
+    evaluator.score_dirty = true;
+    let new_score = evaluator.get_score(ctx);
     let delta = new_score - old_score;
 
     if delta <= 0.0 || rng.gen::<f64>() < (-delta / temp).exp() {
-        *evaluator = Evaluator::new(ctx, &assignment);
         true
     } else {
+        // 回滚 key_weighted_usage
+        for &(gi, old_k, new_k) in &[(g1, k2, k1), (g2, k3, k2), (g3, k1, k3)] {
+            if old_k == new_k {
+                continue;
+            }
+            for &ci in &ctx.group_to_chars[gi] {
+                let freq_f = ctx.char_infos[ci].frequency as f64;
+                for &p in &ctx.char_infos[ci].parts {
+                    if p >= GROUP_MARKER && (p - GROUP_MARKER) as usize == gi {
+                        evaluator.key_weighted_usage[old_k as usize] -= freq_f;
+                        evaluator.key_weighted_usage[new_k as usize] += freq_f;
+                    }
+                }
+            }
+        }
+
+        // 回滚 assignment
         assignment[g1] = k1;
         assignment[g2] = k2;
         assignment[g3] = k3;
+
+        // 回滚编码
+        for &gi in &[g1, g2, g3] {
+            for &ci in &ctx.group_to_chars[gi] {
+                evaluator.update_char(ctx, assignment, ci);
+            }
+        }
+
+        if needs_simple {
+            evaluator.rebuild_simple(ctx, assignment);
+        }
+
+        evaluator.cached_score = old_score;
+        evaluator.score_dirty = false;
         false
     }
 }
@@ -365,11 +421,9 @@ fn enhanced_hill_climb(
     let mut collisions = find_collision_groups(ctx, &assignment);
 
     for step in 0..max_steps {
-        let score_before = evaluator.get_score(ctx);
-
         let op_type = step % 10;
 
-        let _success = match op_type {
+        let success = match op_type {
             0..=3 => {
                 if !collisions.is_empty() {
                     try_resolve_conflict(ctx, &mut assignment, &mut evaluator, &collisions, zero_temp, rng)
@@ -380,10 +434,8 @@ fn enhanced_hill_climb(
             4..=6 => {
                 if n >= 2 {
                     let r1 = rng.gen_range(0..n);
-                    let r2 = loop {
-                        let x = rng.gen_range(0..n);
-                        if x != r1 { break x; }
-                    };
+                    let r2 = rng.gen_range(0..n - 1);
+                    let r2 = if r2 >= r1 { r2 + 1 } else { r2 };
                     let k1 = assignment[r1];
                     let k2 = assignment[r2];
                     if ctx.groups[r1].allowed_keys.contains(&k2)
@@ -407,11 +459,10 @@ fn enhanced_hill_climb(
             }
         };
 
-        let score_after = evaluator.get_score(ctx);
-
-        if score_after < score_before - 1e-12 {
+        // At zero_temp, success means score improved (only strict improvements accepted)
+        if success {
             no_improve_count = 0;
-            if step % 100 == 0 {
+            if step % 200 == 0 {
                 collisions = find_collision_groups(ctx, &assignment);
             }
         } else {
@@ -442,14 +493,14 @@ fn hill_climb_warmup(
 fn coordinate_descent(ctx: &OptContext, init: Vec<u8>) -> (Vec<u8>, f64) {
     let mut assignment = init;
     let n = assignment.len();
+    let mut evaluator = Evaluator::new(ctx, &assignment);
     let mut improved = true;
 
     while improved {
         improved = false;
         for gi in 0..n {
             let current_key = assignment[gi];
-            let mut current_eval = Evaluator::new(ctx, &assignment);
-            let current_score = current_eval.get_score(ctx);
+            let current_score = evaluator.get_score(ctx);
 
             let mut best_key = current_key;
             let mut best_score = current_score;
@@ -458,24 +509,83 @@ fn coordinate_descent(ctx: &OptContext, init: Vec<u8>) -> (Vec<u8>, f64) {
                 if k == current_key {
                     continue;
                 }
+
+                // 增量前向：移动到候选键
+                let needs_simple = evaluator.has_simple_impact(ctx, gi);
+
+                for &ci in &ctx.group_to_chars[gi] {
+                    let freq_f = ctx.char_infos[ci].frequency as f64;
+                    for &p in &ctx.char_infos[ci].parts {
+                        if p >= GROUP_MARKER && (p - GROUP_MARKER) as usize == gi {
+                            evaluator.key_weighted_usage[assignment[gi] as usize] -= freq_f;
+                            evaluator.key_weighted_usage[k as usize] += freq_f;
+                        }
+                    }
+                }
+
+                let prev_key = assignment[gi];
                 assignment[gi] = k;
-                let mut eval = Evaluator::new(ctx, &assignment);
-                let score = eval.get_score(ctx);
+                for &ci in &ctx.group_to_chars[gi] {
+                    evaluator.update_char(ctx, &assignment, ci);
+                }
+                if needs_simple {
+                    evaluator.rebuild_simple(ctx, &assignment);
+                }
+                evaluator.score_dirty = true;
+                let score = evaluator.get_score(ctx);
+
                 if score < best_score - 1e-12 {
                     best_score = score;
                     best_key = k;
                 }
+
+                // 回滚
+                for &ci in &ctx.group_to_chars[gi] {
+                    let freq_f = ctx.char_infos[ci].frequency as f64;
+                    for &p in &ctx.char_infos[ci].parts {
+                        if p >= GROUP_MARKER && (p - GROUP_MARKER) as usize == gi {
+                            evaluator.key_weighted_usage[k as usize] -= freq_f;
+                            evaluator.key_weighted_usage[prev_key as usize] += freq_f;
+                        }
+                    }
+                }
+                assignment[gi] = prev_key;
+                for &ci in &ctx.group_to_chars[gi] {
+                    evaluator.update_char(ctx, &assignment, ci);
+                }
+                if needs_simple {
+                    evaluator.rebuild_simple(ctx, &assignment);
+                }
+                evaluator.cached_score = current_score;
+                evaluator.score_dirty = false;
             }
 
-            assignment[gi] = best_key;
             if best_key != current_key {
+                // 应用最优移动
+                let needs_simple = evaluator.has_simple_impact(ctx, gi);
+                for &ci in &ctx.group_to_chars[gi] {
+                    let freq_f = ctx.char_infos[ci].frequency as f64;
+                    for &p in &ctx.char_infos[ci].parts {
+                        if p >= GROUP_MARKER && (p - GROUP_MARKER) as usize == gi {
+                            evaluator.key_weighted_usage[current_key as usize] -= freq_f;
+                            evaluator.key_weighted_usage[best_key as usize] += freq_f;
+                        }
+                    }
+                }
+                assignment[gi] = best_key;
+                for &ci in &ctx.group_to_chars[gi] {
+                    evaluator.update_char(ctx, &assignment, ci);
+                }
+                if needs_simple {
+                    evaluator.rebuild_simple(ctx, &assignment);
+                }
+                evaluator.score_dirty = true;
                 improved = true;
             }
         }
     }
 
-    let mut eval = Evaluator::new(ctx, &assignment);
-    let score = eval.get_score(ctx);
+    let score = evaluator.get_score(ctx);
     (assignment, score)
 }
 
@@ -615,6 +725,8 @@ pub fn simulated_annealing(
 
     let swap_prob_base = cfg.annealing.swap_probability;
 
+    let sa_start = Instant::now();
+
     // 主循环
     for step in 0..steps {
         let _progress = step as f64 / steps as f64;
@@ -658,9 +770,11 @@ pub fn simulated_annealing(
 
             if thread_id == 0 && best_score <= last_best_score - 0.9 {
                 let m = best_metrics;
+                let elapsed = sa_start.elapsed().as_secs_f64();
+                let speed = if elapsed > 0.0 { step as f64 / elapsed } else { 0.0 };
                 println!(
-                    "   [T0] 步数 {}/{} | 温度 {:.6} | 重码:{} 重码率:{:.4}% 当量:{:.4} | 得分: {:.4}",
-                    step, steps, temp, m.collision_count, m.collision_rate * 100.0,
+                    "   [T0] 步数 {}/{} | {:.1} 万步/分钟 | 温度 {:.6} | 重码:{} 重码率:{:.4}% 当量:{:.4} | 得分: {:.4}",
+                    step, steps, speed * 60.0 / 10000.0, temp, m.collision_count, m.collision_rate * 100.0,
                     m.equiv_mean, best_score
                 );
                 last_best_score = best_score;
@@ -674,15 +788,17 @@ pub fn simulated_annealing(
             steps_since_improve = 0;
 
             if thread_id == 0 {
+                let elapsed = sa_start.elapsed().as_secs_f64();
+                let speed = if elapsed > 0.0 { step as f64 / elapsed } else { 0.0 };
                 println!(
-                    "   [T0] 步数 {}: Reheat ×{:.1} (基温 {:.6})",
-                    step, cfg.annealing.reheat_factor, base_temp
+                    "   [T0] 步数 {} | {:.1} 万步/分钟: Reheat ×{:.1} (基温 {:.6})",
+                    step, speed * 60.0 / 10000.0, cfg.annealing.reheat_factor, base_temp
                 );
             }
         }
 
         // 智能低温扰动
-        if step > 0 && step % perturb_interval == 0 && base_temp < cfg.annealing.comfort_temp * 0.01 {
+        if perturb_interval > 0 && step > 0 && step % perturb_interval == 0 && base_temp < cfg.annealing.comfort_temp * 0.01 {
             let collisions = find_collision_groups(ctx, &assignment);
             let n_perturb = (n_groups as f64 * cfg.annealing.perturb_strength) as usize;
             
@@ -728,9 +844,11 @@ pub fn simulated_annealing(
         if thread_id == 0 && step % report_interval == 0 && step > 0 {
             let pct = step * 100 / steps;
             let m = evaluator.get_metrics(ctx);
+            let elapsed = sa_start.elapsed().as_secs_f64();
+            let speed = if elapsed > 0.0 { step as f64 / elapsed } else { 0.0 };
             println!(
-                "   [T0] 进度: {}% | 基温: {:.6} | 重码={} 当量={:.4} | 当前: {:.4} 🏆最优: {:.4}",
-                pct, base_temp, m.collision_count, m.equiv_mean,
+                "   [T0] 进度: {}% | {:.1} 万步/分钟 | 基温: {:.6} | 重码={} 当量={:.4} | 当前: {:.4} 🏆最优: {:.4}",
+                pct, speed * 60.0 / 10000.0, base_temp, m.collision_count, m.equiv_mean,
                 evaluator.get_score(ctx), best_score
             );
         }
