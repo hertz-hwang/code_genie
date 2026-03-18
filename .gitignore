@@ -1,7 +1,10 @@
-/examples
-/target
-/output-*
-/missing-*
-/tmp
-/plans
-/cpp
+**/.DS_Store
+**/examples
+**/target
+**/output-*
+**/missing-*
+**/tmp
+**/plans
+**/cpp
+**/log*
+**/config.toml
