@@ -58,6 +58,8 @@ pub struct OptContext {
     pub root_full_codes: HashMap<String, Vec<String>>,
     /// 每个组的加权频率总和（用于 key_weighted_usage 的 O(1) 更新）
     pub group_freq_sum: Vec<f64>,
+    /// code_base 的幂次表（code_base_powers[i] = code_base^i），用于增量编码计算
+    pub code_base_powers: Vec<usize>,
 }
 
 impl OptContext {
@@ -173,6 +175,12 @@ impl OptContext {
             }
         }
 
+        // 预计算 code_base 的幂次表
+        let mut code_base_powers = vec![1usize; max_parts + 1];
+        for i in 1..=max_parts {
+            code_base_powers[i] = code_base_powers[i - 1] * code_base;
+        }
+
         Self {
             enable_simple_code,
             weights,
@@ -195,6 +203,7 @@ impl OptContext {
             group_to_simple_affected,
             root_full_codes,
             group_freq_sum,
+            code_base_powers,
         }
     }
 

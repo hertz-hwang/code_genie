@@ -3,7 +3,7 @@
 // =========================================================================
 
 use rand::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::context::OptContext;
 use crate::types::{KeyDistConfig, Metrics, SimpleMetrics, EQUIV_TABLE_SIZE};
@@ -28,16 +28,16 @@ struct SimpleLevelTracker {
     key_usage: [f64; EQUIV_TABLE_SIZE],
     /// 键击次数
     key_presses: f64,
-    /// 已分配的汉字集合
-    assigned_chars: HashSet<usize>,
+    /// 已分配的汉字列表
+    assigned_chars: Vec<usize>,
 }
 
 /// 简码评估器
 pub struct SimpleEvaluator {
     /// 各简码级别的跟踪器
     levels: Vec<SimpleLevelTracker>,
-    /// 所有出简的汉字集合（跨级别）
-    all_assigned_chars: HashSet<usize>,
+    /// 所有出简的汉字标记（跨级别），Vec<bool> 替代 HashSet 加速查找
+    all_assigned_flags: Vec<bool>,
     /// 简码重码数：全码桶去掉出简字后仍有重码的数量
     simple_collision_count: usize,
     /// 简码重码率：全码桶去掉出简字后仍被重码的字频 / 总频
@@ -46,6 +46,8 @@ pub struct SimpleEvaluator {
     cached_simple_score: f64,
     /// 得分是否需要重新计算
     simple_score_dirty: bool,
+    /// 按频率降序排列的汉字索引（缓存，频率不变所以排序不变）
+    sorted_chars: Vec<usize>,
 }
 
 impl SimpleEvaluator {
@@ -69,7 +71,7 @@ impl SimpleEvaluator {
                 equiv_freq_sum: 0,
                 key_usage: [0.0; EQUIV_TABLE_SIZE],
                 key_presses: 0.0,
-                assigned_chars: HashSet::new(),
+                assigned_chars: Vec::new(),
             })
             .collect();
 
@@ -81,7 +83,7 @@ impl SimpleEvaluator {
                 .cmp(&ctx.char_infos[a].frequency)
         });
 
-        let mut globally_assigned: HashSet<usize> = HashSet::new();
+        let mut globally_assigned = vec![false; n_chars];
 
         for li in 0..n_levels {
             Self::build_level(
@@ -93,7 +95,7 @@ impl SimpleEvaluator {
                 &globally_assigned,
             );
             for &ci in &levels[li].assigned_chars {
-                globally_assigned.insert(ci);
+                globally_assigned[ci] = true;
             }
         }
 
@@ -103,11 +105,12 @@ impl SimpleEvaluator {
 
         let mut se = Self {
             levels,
-            all_assigned_chars: globally_assigned,
+            all_assigned_flags: globally_assigned,
             simple_collision_count: sc_count,
             simple_collision_rate: sc_rate,
             cached_simple_score: 0.0,
             simple_score_dirty: true,
+            sorted_chars,
         };
         se.cached_simple_score = se.compute_simple_score(ctx);
         se.simple_score_dirty = false;
@@ -121,7 +124,7 @@ impl SimpleEvaluator {
         level: &mut SimpleLevelTracker,
         li: usize,
         sorted_chars: &[usize],
-        excluded: &HashSet<usize>,
+        excluded: &[bool],
     ) {
         level.code_to_candidates.clear();
         level.covered_freq = 0;
@@ -132,7 +135,7 @@ impl SimpleEvaluator {
         level.assigned_chars.clear();
 
         for &ci in sorted_chars {
-            if excluded.contains(&ci) {
+            if excluded[ci] {
                 continue;
             }
             if let Some(code) = ctx.calc_simple_code(ci, li, assignment) {
@@ -151,7 +154,7 @@ impl SimpleEvaluator {
                 candidates
                     .iter()
                     .take(level.code_num)
-                    .filter(|(ci, _)| !excluded.contains(ci))
+                    .filter(|(ci, _)| !excluded[*ci])
                     .map(|&(ci, _)| ci)
             })
             .collect();
@@ -160,7 +163,7 @@ impl SimpleEvaluator {
             let ci = *ci;
             let freq = ctx.char_infos[ci].frequency;
             level.covered_freq += freq;
-            level.assigned_chars.insert(ci);
+            level.assigned_chars.push(ci);
 
             let eq = ctx.calc_simple_equiv(ci, li, assignment);
             level.equiv_weighted += eq * freq as f64;
@@ -181,7 +184,7 @@ impl SimpleEvaluator {
     fn compute_simple_collisions(
         ctx: &OptContext,
         full_code_to_chars: &[Vec<usize>],
-        assigned: &HashSet<usize>,
+        assigned: &[bool],
     ) -> (usize, f64) {
         let mut total_collision_count: usize = 0;
         let mut total_collision_freq: u64 = 0;
@@ -191,26 +194,22 @@ impl SimpleEvaluator {
                 continue;
             }
             // 过滤掉已出简的字
-            let remaining: Vec<usize> = chars
-                .iter()
-                .filter(|ci| !assigned.contains(ci))
-                .copied()
-                .collect();
-
-            let n = remaining.len();
-            if n >= 2 {
-                // 重码数 = n - 1
-                total_collision_count += n - 1;
-                // 重码率：桶中频率总和 - 最高频率的那个字
-                let mut max_freq = 0u64;
-                let mut sum_freq = 0u64;
-                for &ci in &remaining {
+            let mut n = 0usize;
+            let mut max_freq = 0u64;
+            let mut sum_freq = 0u64;
+            for &ci in chars {
+                if !assigned[ci] {
                     let f = ctx.char_infos[ci].frequency;
                     sum_freq += f;
                     if f > max_freq {
                         max_freq = f;
                     }
+                    n += 1;
                 }
+            }
+
+            if n >= 2 {
+                total_collision_count += n - 1;
                 total_collision_freq += sum_freq - max_freq;
             }
         }
@@ -231,17 +230,12 @@ impl SimpleEvaluator {
         assignment: &[u8],
         full_code_to_chars: &[Vec<usize>],
     ) {
-        let n_chars = ctx.char_infos.len();
         let n_levels = ctx.simple_config.levels.len();
+        let n_chars = ctx.char_infos.len();
 
-        let mut sorted_chars: Vec<usize> = (0..n_chars).collect();
-        sorted_chars.sort_by(|&a, &b| {
-            ctx.char_infos[b]
-                .frequency
-                .cmp(&ctx.char_infos[a].frequency)
-        });
-
-        let mut globally_assigned: HashSet<usize> = HashSet::new();
+        // 重用 all_assigned_flags，清零
+        self.all_assigned_flags.clear();
+        self.all_assigned_flags.resize(n_chars, false);
 
         for li in 0..n_levels {
             Self::build_level(
@@ -249,17 +243,16 @@ impl SimpleEvaluator {
                 assignment,
                 &mut self.levels[li],
                 li,
-                &sorted_chars,
-                &globally_assigned,
+                &self.sorted_chars,
+                &self.all_assigned_flags,
             );
             for &ci in &self.levels[li].assigned_chars {
-                globally_assigned.insert(ci);
+                self.all_assigned_flags[ci] = true;
             }
         }
 
         let (sc_count, sc_rate) =
-            Self::compute_simple_collisions(ctx, full_code_to_chars, &globally_assigned);
-        self.all_assigned_chars = globally_assigned;
+            Self::compute_simple_collisions(ctx, full_code_to_chars, &self.all_assigned_flags);
         self.simple_collision_count = sc_count;
         self.simple_collision_rate = sc_rate;
 
@@ -371,7 +364,6 @@ pub struct Evaluator {
     /// 每个桶的频率总和
     bucket_freq_sum: Vec<u64>,
     /// 每个桶的最大频率（用于增量 collision_freq 计算）
-    /// 注意：swap_remove 后 max 可能失效，需要重扫。用 second_max 优化常见情况。
     bucket_max_freq: Vec<u64>,
 
     /// 总重码数
