@@ -617,24 +617,39 @@ impl Evaluator {
     /// 计算全码得分
     #[inline(always)]
     pub fn compute_full_score(&self, ctx: &OptContext) -> f64 {
-        let collision_rate = self.collision_frequency as f64 * self.inv_total_frequency;
-        let weighted_equiv = self.total_equiv_weighted * self.inv_total_frequency;
-        let equiv_cv = self.calc_equiv_cv();
-        let dist_deviation = self.calc_distribution_deviation(&ctx.key_dist_config);
+        let mut score = ctx.weights.weight_collision_count
+            * self.total_collisions as f64
+            * ctx.scale_config.collision_count;
 
-        let scaled = (
-            self.total_collisions as f64 * ctx.scale_config.collision_count,
-            collision_rate * ctx.scale_config.collision_rate,
-            weighted_equiv * ctx.scale_config.equivalence,
-            equiv_cv * ctx.scale_config.equiv_cv,
-            dist_deviation * ctx.scale_config.distribution,
-        );
+        if ctx.weights.weight_collision_rate > 0.0 {
+            let collision_rate = self.collision_frequency as f64 * self.inv_total_frequency;
+            score += ctx.weights.weight_collision_rate
+                * collision_rate
+                * ctx.scale_config.collision_rate;
+        }
 
-        ctx.weights.weight_collision_count * scaled.0
-            + ctx.weights.weight_collision_rate * scaled.1
-            + ctx.weights.weight_equivalence * scaled.2
-            + ctx.weights.weight_equiv_cv * scaled.3
-            + ctx.weights.weight_distribution * scaled.4
+        if ctx.weights.weight_equivalence > 0.0 {
+            let weighted_equiv = self.total_equiv_weighted * self.inv_total_frequency;
+            score += ctx.weights.weight_equivalence
+                * weighted_equiv
+                * ctx.scale_config.equivalence;
+        }
+
+        if ctx.weights.weight_equiv_cv > 0.0 {
+            let equiv_cv = self.calc_equiv_cv();
+            score += ctx.weights.weight_equiv_cv
+                * equiv_cv
+                * ctx.scale_config.equiv_cv;
+        }
+
+        if ctx.weights.weight_distribution > 0.0 {
+            let dist_deviation = self.calc_distribution_deviation(&ctx.key_dist_config);
+            score += ctx.weights.weight_distribution
+                * dist_deviation
+                * ctx.scale_config.distribution;
+        }
+
+        score
     }
 
     /// 计算综合得分

@@ -600,7 +600,7 @@ pub fn multi_start_init(ctx: &OptContext, cfg: &Config, thread_id: usize) -> Vec
         return vec![];
     }
 
-    let n_candidates: usize = if n < 100 { 32 } else if n < 1000 { 20 } else { 12 };
+    let n_candidates: usize = if n < 100 { 50 } else if n < 1000 { 50 } else { 30 };
     let warmup_steps = (n * 30).max(2000).min(50_000);
 
     let mut best_assignment: Option<Vec<u8>> = None;
@@ -748,10 +748,16 @@ pub fn simulated_annealing(
 
             let k1 = assignment[r1];
             let k2 = assignment[r2];
-            let can_swap = ctx.groups[r1].allowed_keys.contains(&k2)
-                && ctx.groups[r2].allowed_keys.contains(&k1);
-            if can_swap {
+            if k1 != k2
+                && ctx.groups[r1].allowed_keys.contains(&k2)
+                && ctx.groups[r2].allowed_keys.contains(&k1)
+            {
                 evaluator.try_swap(ctx, &mut assignment, r1, r2, temp, &mut rng);
+            } else {
+                let r = r1;
+                let allowed = &ctx.groups[r].allowed_keys;
+                let new_k = allowed[rng.gen_range(0..allowed.len())];
+                evaluator.try_move(ctx, &mut assignment, r, new_k, temp, &mut rng);
             }
         } else {
             let r = rng.gen_range(0..n_groups);
