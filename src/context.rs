@@ -7,12 +7,13 @@ use std::collections::{HashMap, HashSet};
 use crate::types::{
     build_root_full_codes, CharInfo, CharSimpleInfo, compute_level_instructions,
     extract_logical_roots_full, try_resolve_rule, KeyDistConfig,
-    LogicalRoot, RootGroup, ScaleConfig, SimpleCodeConfig, WeightConfig, KEY_SPACE, EQUIV_TABLE_SIZE,
+    RootGroup, ScaleConfig, SimpleCodeConfig, WeightConfig, KEY_SPACE, EQUIV_TABLE_SIZE,
     GROUP_MARKER,
 };
+use crate::keysoul;
 
-/// 等价表类型别名
-pub type EquivTable = [[f64; EQUIV_TABLE_SIZE]; EQUIV_TABLE_SIZE];
+/// pair 当量表类型（从文件加载后传入 OptContext::new）
+pub type PairEquivTable = [[f64; EQUIV_TABLE_SIZE]; EQUIV_TABLE_SIZE];
 
 /// 优化上下文 - 存储所有算法需要的数据
 pub struct OptContext {
@@ -34,8 +35,14 @@ pub struct OptContext {
     pub groups: Vec<RootGroup>,
     /// 固定字根映射
     pub fixed_roots: HashMap<String, u8>,
-    /// 当量表
-    pub equiv_table: EquivTable,
+    /// 全序列当量表（最长序列匹配）
+    /// 索引方案：长度 n 的序列 [k0..k_{n-1}]
+    ///   flat = sum(ki * KEY_COUNT^(n-1-i))
+    ///   index = equiv_table_offsets[n] + flat
+    /// 覆盖长度 1..=max_parts（长度 1 存单键自身当量，通常为 0）
+    pub equiv_table: Vec<f64>,
+    /// equiv_table 各长度的起始偏移（equiv_table_offsets[n] = 长度 n 序列的起始位置）
+    pub equiv_table_offsets: Vec<usize>,
     /// 键位分布配置
     pub key_dist_config: [KeyDistConfig; EQUIV_TABLE_SIZE],
     /// 总频率
@@ -60,6 +67,21 @@ pub struct OptContext {
     pub group_freq_sum: Vec<f64>,
     /// code_base 的幂次表（code_base_powers[i] = code_base^i），用于增量编码计算
     pub code_base_powers: Vec<usize>,
+
+    /// 增量编码掩码：group_char_masks[group_idx] = [(char_idx, mask), ...]
+    /// mask = Σ code_base^(n-1-pos) 对于该 group 在该汉字中出现的所有位置
+    /// 用于 O(1) 增量编码更新：new_code = old_code + mask * (new_key - old_key)
+    pub group_char_masks: Vec<Vec<(usize, usize)>>,
+
+    // === 热路径优化标志（预计算，避免每次 update_char 查权重）===
+    /// 是否需要维护等价值（weight_equivalence > 0 或 weight_equiv_cv > 0）
+    pub need_equiv: bool,
+    /// 是否需要维护碰撞频率（weight_collision_rate > 0）
+    pub need_collision_rate: bool,
+    /// 是否需要维护桶成员列表（enable_simple_code 或 need_collision_rate）
+    pub need_bucket_members: bool,
+    /// 是否使用键魂当量模型（仅用于日志输出，热路径不分支）
+    pub use_keysoul: bool,
 }
 
 impl OptContext {
@@ -68,11 +90,12 @@ impl OptContext {
         splits: &[(char, Vec<String>, u64)],
         fixed_roots: &HashMap<String, u8>,
         groups: &[RootGroup],
-        equiv_table: EquivTable,
+        pair_table: PairEquivTable,
         key_dist_config: [KeyDistConfig; EQUIV_TABLE_SIZE],
         scale_config: ScaleConfig,
         simple_config: SimpleCodeConfig,
         weights: WeightConfig,
+        use_keysoul: bool,
     ) -> Self {
         let enable_simple_code = weights.enable_simple_code;
         let mut root_to_group: HashMap<String, usize> = HashMap::new();
@@ -97,6 +120,8 @@ impl OptContext {
             let mut info = CharInfo {
                 parts: Vec::with_capacity(roots.len()),
                 frequency: *freq,
+                current_code: 0,
+                current_key_indices: Vec::with_capacity(roots.len()),
             };
 
             let mut seen_groups = HashSet::new();
@@ -104,8 +129,10 @@ impl OptContext {
             for root in roots {
                 if let Some(&key) = fixed_roots.get(root) {
                     info.parts.push(key as u16);
+                    info.current_key_indices.push(key as u16);
                 } else if let Some(&gi) = root_to_group.get(root) {
                     info.parts.push(gi as u16 + GROUP_MARKER);
+                    info.current_key_indices.push(gi as u16 + GROUP_MARKER);
                     seen_groups.insert(gi);
                 }
             }
@@ -151,6 +178,8 @@ impl OptContext {
                 }
             }
 
+            info.current_key_indices = info.parts.clone();
+
             char_simple_infos.push(CharSimpleInfo {
                 logical_roots,
                 level_instructions,
@@ -162,8 +191,6 @@ impl OptContext {
         let code_base = EQUIV_TABLE_SIZE + 1;
         let code_space = crate::types::pow_base(code_base, max_parts);
 
-        // 预计算每个组的加权频率总和
-        // group_freq_sum[r] = sum of freq_f for each (ci, part) where part references group r
         let mut group_freq_sum = vec![0.0f64; num_groups];
         for ci in 0..char_infos.len() {
             let freq_f = char_infos[ci].frequency as f64;
@@ -175,10 +202,73 @@ impl OptContext {
             }
         }
 
-        // 预计算 code_base 的幂次表
         let mut code_base_powers = vec![1usize; max_parts + 1];
         for i in 1..=max_parts {
             code_base_powers[i] = code_base_powers[i - 1] * code_base;
+        }
+
+        let mut group_char_masks: Vec<Vec<(usize, usize)>> = vec![Vec::new(); num_groups];
+        for (ci, info) in char_infos.iter().enumerate() {
+            let n = info.parts.len();
+            let mut group_mask: HashMap<usize, usize> = HashMap::new();
+            for (pos, &p) in info.parts.iter().enumerate() {
+                if p >= GROUP_MARKER {
+                    let gi = (p - GROUP_MARKER) as usize;
+                    *group_mask.entry(gi).or_insert(0) += code_base_powers[n - 1 - pos];
+                }
+            }
+            for (gi, mask) in group_mask {
+                group_char_masks[gi].push((ci, mask));
+            }
+        }
+
+        let need_equiv = weights.weight_equivalence > 0.0 || weights.weight_equiv_cv > 0.0;
+        let need_collision_rate = weights.weight_collision_rate > 0.0;
+        let need_bucket_members = enable_simple_code || need_collision_rate;
+
+        // 预计算全序列当量表（最长序列匹配）
+        // offsets[n] = 长度 n 序列在 equiv_table 中的起始位置
+        // 覆盖长度 1..=max_parts
+        let key_count = EQUIV_TABLE_SIZE;
+        let mut offsets = vec![0usize; max_parts + 1];
+        let mut acc = 0usize;
+        for n in 1..=max_parts {
+            offsets[n] = acc;
+            acc += key_count.pow(n as u32);
+        }
+        let mut table = vec![0.0f64; acc];
+
+        // 长度 1：单键当量为 0（无转移）
+        // offsets[1] 已填充为 0.0，无需额外处理
+
+        // 长度 2..=max_parts
+        for n in 2..=max_parts {
+            let base = offsets[n];
+            let count = key_count.pow(n as u32);
+            let mut indices = vec![0u8; n];
+            for flat in 0..count {
+                // 将 flat 解码为 indices（大端，base key_count）
+                let mut tmp = flat;
+                for pos in (0..n).rev() {
+                    indices[pos] = (tmp % key_count) as u8;
+                    tmp /= key_count;
+                }
+
+                let val = if use_keysoul {
+                    let time = keysoul::calc_keysoul_from_indices(&indices);
+                    if time < 0.0 { 0.0 } else { time / n as f64 }
+                } else {
+                    // pair 累加：sum(pair[i][i+1]) + pair[last][SPACE]，除以 n
+                    let mut total = 0.0;
+                    for i in 0..n - 1 {
+                        total += pair_table[indices[i] as usize][indices[i + 1] as usize];
+                    }
+                    total += pair_table[indices[n - 1] as usize][KEY_SPACE];
+                    total / n as f64
+                };
+
+                table[base + flat] = val;
+            }
         }
 
         Self {
@@ -191,7 +281,8 @@ impl OptContext {
             raw_splits: splits.to_vec(),
             groups: groups.to_vec(),
             fixed_roots: fixed_roots.clone(),
-            equiv_table,
+            equiv_table: table,
+            equiv_table_offsets: offsets,
             key_dist_config,
             total_frequency,
             code_base,
@@ -204,6 +295,11 @@ impl OptContext {
             root_full_codes,
             group_freq_sum,
             code_base_powers,
+            group_char_masks,
+            need_equiv,
+            need_collision_rate,
+            need_bucket_members,
+            use_keysoul,
         }
     }
 
@@ -217,8 +313,28 @@ impl OptContext {
         }
     }
 
+    /// 更新单个汉字的 key_indices（当其某个 radical 的分配改变时）
+    #[allow(dead_code)]
+    pub fn update_char_key_indices(&self, ci: usize, assignment: &[u8], key_indices: &mut Vec<u16>) {
+        let info = &self.char_infos[ci];
+        key_indices.clear();
+        for &p in &info.parts {
+            key_indices.push(self.resolve_key(p, assignment) as u16);
+        }
+    }
+
+    /// 计算仅全码（使用临时缓冲区）
+    #[allow(dead_code)]
+    pub fn calc_code_only_fast(&self, ci: usize, key_indices: &[u16]) -> usize {
+        let info = &self.char_infos[ci];
+        let mut code = 0usize;
+        for &ki in key_indices.iter().take(info.parts.len()) {
+            code = code * self.code_base + (ki as usize + 1);
+        }
+        code
+    }
+
     /// 计算仅全码
-    #[inline(always)]
     pub fn calc_code_only(&self, ci: usize, assignment: &[u8]) -> usize {
         let info = &self.char_infos[ci];
         let mut code = 0usize;
@@ -229,25 +345,38 @@ impl OptContext {
         code
     }
 
-    /// 从拆分计算等价值
+    /// 从拆分计算等价值（最长序列匹配查表）
     #[inline(always)]
     pub fn calc_equiv_from_parts(&self, ci: usize, assignment: &[u8]) -> f64 {
         let info = &self.char_infos[ci];
         let n = info.parts.len();
-        if n == 0 {
+        if n == 0 || n >= self.equiv_table_offsets.len() {
             return 0.0;
         }
-
-        let mut prev_key = self.resolve_key(info.parts[0], assignment) as usize;
-        let mut total = 0.0;
-
-        for i in 1..n {
-            let cur_key = self.resolve_key(info.parts[i], assignment) as usize;
-            total += self.equiv_table[prev_key][cur_key];
-            prev_key = cur_key;
+        let base = self.equiv_table_offsets[n];
+        let key_count = EQUIV_TABLE_SIZE;
+        let mut flat = 0usize;
+        for &p in &info.parts {
+            flat = flat * key_count + self.resolve_key(p, assignment) as usize;
         }
-        total += self.equiv_table[prev_key][KEY_SPACE];
-        total / n as f64
+        self.equiv_table[base + flat]
+    }
+
+    /// 从预计算 key_indices 计算等价值
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub fn calc_equiv_from_key_indices(&self, _ci: usize, key_indices: &[u16]) -> f64 {
+        let n = key_indices.len();
+        if n == 0 || n >= self.equiv_table_offsets.len() {
+            return 0.0;
+        }
+        let base = self.equiv_table_offsets[n];
+        let key_count = EQUIV_TABLE_SIZE;
+        let mut flat = 0usize;
+        for &ki in key_indices {
+            flat = flat * key_count + ki as usize;
+        }
+        self.equiv_table[base + flat]
     }
 
     /// 计算简码
@@ -286,7 +415,7 @@ impl OptContext {
         Some(keys)
     }
 
-    /// 计算简码等价值
+    /// 计算简码等价值（最长序列匹配查表）
     #[inline]
     pub fn calc_simple_equiv(&self, ci: usize, level_idx: usize, assignment: &[u8]) -> f64 {
         let si = &self.char_simple_infos[ci];
@@ -295,29 +424,55 @@ impl OptContext {
             _ => return 0.0,
         };
         let n = instr.len();
-        if n == 0 {
+        if n == 0 || n >= self.equiv_table_offsets.len() {
             return 0.0;
         }
-
-        let (root_idx0, code_idx0) = instr[0];
-        let lr0 = &si.logical_roots[root_idx0];
-        if code_idx0 >= lr0.full_code_parts.len() {
-            return 0.0;
-        }
-        let mut prev_key = self.resolve_key(lr0.full_code_parts[code_idx0], assignment) as usize;
-        let mut total = 0.0;
-
-        for i in 1..n {
-            let (ri, ci_code) = instr[i];
-            let lr = &si.logical_roots[ri];
-            if ci_code >= lr.full_code_parts.len() {
+        let base = self.equiv_table_offsets[n];
+        let key_count = EQUIV_TABLE_SIZE;
+        let mut flat = 0usize;
+        for &(root_idx, code_idx) in instr {
+            let lr = &si.logical_roots[root_idx];
+            if code_idx >= lr.full_code_parts.len() {
                 return 0.0;
             }
-            let cur_key = self.resolve_key(lr.full_code_parts[ci_code], assignment) as usize;
-            total += self.equiv_table[prev_key][cur_key];
-            prev_key = cur_key;
+            flat = flat * key_count + self.resolve_key(lr.full_code_parts[code_idx], assignment) as usize;
         }
-        total += self.equiv_table[prev_key][KEY_SPACE];
-        total / n as f64
+        self.equiv_table[base + flat]
+    }
+}
+
+// 实现 Clone（OptContext 只包含数据结构，可以克隆）
+impl Clone for OptContext {
+    fn clone(&self) -> Self {
+        Self {
+            enable_simple_code: self.enable_simple_code,
+            weights: self.weights.clone(),
+            num_groups: self.num_groups,
+            root_to_group: self.root_to_group.clone(),
+            group_to_chars: self.group_to_chars.clone(),
+            char_infos: self.char_infos.clone(),
+            raw_splits: self.raw_splits.clone(),
+            groups: self.groups.clone(),
+            fixed_roots: self.fixed_roots.clone(),
+            equiv_table: self.equiv_table.clone(),
+            equiv_table_offsets: self.equiv_table_offsets.clone(),
+            key_dist_config: self.key_dist_config,
+            total_frequency: self.total_frequency,
+            code_base: self.code_base,
+            max_parts: self.max_parts,
+            code_space: self.code_space,
+            scale_config: self.scale_config.clone(),
+            simple_config: self.simple_config.clone(),
+            char_simple_infos: self.char_simple_infos.clone(),
+            group_to_simple_affected: self.group_to_simple_affected.clone(),
+            root_full_codes: self.root_full_codes.clone(),
+            group_freq_sum: self.group_freq_sum.clone(),
+            code_base_powers: self.code_base_powers.clone(),
+            group_char_masks: self.group_char_masks.clone(),
+            need_equiv: self.need_equiv,
+            need_collision_rate: self.need_collision_rate,
+            need_bucket_members: self.need_bucket_members,
+            use_keysoul: self.use_keysoul,
+        }
     }
 }

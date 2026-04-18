@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 
-use crate::types::{char_to_key_index, KeyDistConfig, RootGroup, KEY_SPACE};
+use crate::types::{char_to_key_index, KeyDistConfig, RootGroup, EQUIV_TABLE_SIZE};
 
 /// 加载固定字根和受限字根组
 /// 
@@ -145,8 +145,8 @@ pub fn load_splits(path: &str) -> Vec<(char, Vec<String>, u64)> {
 /// 
 /// # 返回值
 /// - 31x31 当量矩阵
-pub fn load_pair_equivalence(path: &str) -> [[f64; 31]; 31] {
-    let mut table = [[0.0f64; 31]; 31];
+pub fn load_pair_equivalence(path: &str) -> [[f64; EQUIV_TABLE_SIZE]; EQUIV_TABLE_SIZE] {
+    let mut table = [[0.0f64; EQUIV_TABLE_SIZE]; EQUIV_TABLE_SIZE];
     let content = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => {
@@ -167,7 +167,7 @@ pub fn load_pair_equivalence(path: &str) -> [[f64; 31]; 31] {
                     (char_to_key_index(chars[0]), char_to_key_index(chars[1]))
                 {
                     if let Ok(equiv) = parts[1].trim().parse::<f64>() {
-                        if k1 < 31 && k2 < 31 {
+                        if k1 < EQUIV_TABLE_SIZE && k2 < EQUIV_TABLE_SIZE {
                             table[k1][k2] = equiv;
                         }
                     }
@@ -271,8 +271,8 @@ pub fn load_keymap(keymap_path: &str, division_path: &str) -> HashMap<String, u8
 /// 
 /// # 返回值
 /// - 31 个键位的分布配置
-pub fn load_key_distribution(path: &str) -> [KeyDistConfig; 31] {
-    let mut cfg = [KeyDistConfig::default(); 31];
+pub fn load_key_distribution(path: &str) -> [KeyDistConfig; EQUIV_TABLE_SIZE] {
+    let mut cfg = [KeyDistConfig::default(); EQUIV_TABLE_SIZE];
     let content = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => {
@@ -288,7 +288,7 @@ pub fn load_key_distribution(path: &str) -> [KeyDistConfig; 31] {
         let parts: Vec<&str> = line.split('\t').collect();
         if parts.len() >= 4 {
             if let Some(ki) = parts[0].chars().next().and_then(char_to_key_index) {
-                if ki < 31 {
+                if ki < EQUIV_TABLE_SIZE {
                     cfg[ki] = KeyDistConfig {
                         target_rate: parts[1].trim().parse().unwrap_or(0.0),
                         low_penalty: parts[2].trim().parse().unwrap_or(0.0),

@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 
-use crate::types::{extract_base_name, RootGroup};
+use crate::types::RootGroup;
 
 /// 校验字根定义是否完整
 /// 

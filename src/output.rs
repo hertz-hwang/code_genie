@@ -101,6 +101,24 @@ pub fn write_keymap_output(
     }
 }
 
+/// 检查简码码位是否被全码占用（与 SimpleEvaluator::is_code_occupied_by_full 逻辑一致）
+fn is_code_occupied_by_full(
+    full_code_to_chars: &[Vec<usize>],
+    code: usize,
+    assigned: &HashSet<usize>,
+) -> bool {
+    if code >= full_code_to_chars.len() {
+        return false;
+    }
+    let chars = &full_code_to_chars[code];
+    for &ci in chars {
+        if !assigned.contains(&ci) {
+            return true; // 该码位上有未出简的全码字
+        }
+    }
+    false
+}
+
 /// 保存简码+全码编码文件
 pub fn save_combined_code_output(ctx: &OptContext, assignment: &[u8], dir: &str) {
     // 构建根名到键位的映射
@@ -115,11 +133,19 @@ pub fn save_combined_code_output(ctx: &OptContext, assignment: &[u8], dir: &str)
         }
     }
 
+    // 构建全码桶
+    let n_chars = ctx.char_infos.len();
+    let cs = ctx.code_space;
+    let mut full_code_to_chars: Vec<Vec<usize>> = vec![Vec::new(); cs];
+    for ci in 0..n_chars {
+        let code = ctx.calc_code_only(ci, assignment);
+        full_code_to_chars[code].push(ci);
+    }
+
     let mut out = String::new();
     let mut simple_assigned: HashSet<usize> = HashSet::new();
 
     // 按字频排序
-    let n_chars = ctx.char_infos.len();
     let mut sorted_chars: Vec<usize> = (0..n_chars).collect();
     sorted_chars.sort_by(|&a, &b| {
         ctx.char_infos[b]
@@ -146,7 +172,12 @@ pub fn save_combined_code_output(ctx: &OptContext, assignment: &[u8], dir: &str)
         // 收集该级别所有获胜者
         let mut level_winners: Vec<(usize, u64, String)> = Vec::new();
 
-        for (_code, candidates) in &code_candidates {
+        for (&code, candidates) in &code_candidates {
+            // 全码占位检查：如果该码位上有未出简的全码字，跳过
+            if is_code_occupied_by_full(&full_code_to_chars, code, &simple_assigned) {
+                continue;
+            }
+
             let mut count = 0;
             for &(ci, freq) in candidates {
                 if count >= level_cfg.code_num {
@@ -209,7 +240,15 @@ pub fn save_simple_code_output(ctx: &OptContext, assignment: &[u8], dir: &str) {
         full_code_to_chars[code].push(ci);
     }
 
-    let se = SimpleEvaluator::new(ctx, assignment, &full_code_to_chars);
+    // 构建非空桶索引
+    let mut populated_codes = Vec::new();
+    for code in 0..cs {
+        if !full_code_to_chars[code].is_empty() {
+            populated_codes.push(code);
+        }
+    }
+
+    let se = SimpleEvaluator::new(ctx, assignment, &populated_codes, &full_code_to_chars);
     let sm = se.get_simple_metrics(ctx);
 
     let mut out = String::new();
@@ -270,7 +309,12 @@ pub fn save_simple_code_output(ctx: &OptContext, assignment: &[u8], dir: &str) {
 
         let mut level_winners: Vec<(usize, u64, String)> = Vec::new();
 
-        for (_code, candidates) in &code_candidates {
+        for (&code, candidates) in &code_candidates {
+            // 全码占位检查：如果该码位上有未出简的全码字，跳过
+            if is_code_occupied_by_full(&full_code_to_chars, code, &globally_assigned) {
+                continue;
+            }
+
             let mut count = 0;
             for &(ci, freq) in candidates {
                 if count >= level_cfg.code_num {
@@ -401,7 +445,7 @@ pub fn save_thread_results(
 
 /// 保存键位分布到目录
 pub fn save_key_distribution_to_dir(ctx: &OptContext, assignment: &[u8], dir: &str) {
-    let display_order = &ctx.weights; // 从 ctx 获取显示顺序需要额外存储，暂时使用默认
+    let _display_order = &ctx.weights; // 从 ctx 获取显示顺序需要额外存储，暂时使用默认
     let evaluator = crate::evaluator::Evaluator::new(ctx, assignment);
     let mut out = String::new();
     out.push_str("# 用指分布统计\n");

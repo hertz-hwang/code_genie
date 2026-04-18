@@ -18,6 +18,7 @@ pub struct Config {
     pub keys: KeysConfig,
     pub weights: WeightsConfig,
     pub annealing: AnnealingConfig,
+    pub amhb: AmhbConfig,
     pub simple_levels: Vec<SimpleLevelConfig>,
 }
 
@@ -84,6 +85,41 @@ pub struct AnnealingConfig {
     pub perturb_strength: f64,
     pub reheat_factor: f64,
     pub max_parts: usize,
+    // AMHB 参数（已移至 [amhb] 节点，这里保留以支持旧配置）
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub total_neighbors: usize,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub steal_threshold: i32,
+}
+
+/// AMHB 分段降温配置
+/// 每个段定义一个温度阈值和冷却系数：当温度 > threshold 时，每步 temp *= factor
+/// 段按 threshold 从高到低匹配，第一个满足的段生效
+/// 若所有段都不匹配（温度已低于最小阈值），返回 -1.0 终止优化
+#[derive(Debug, Clone, Deserialize)]
+pub struct CoolingSegment {
+    /// 温度阈值：当 temp > threshold 时使用此段的 factor
+    pub threshold: f64,
+    /// 冷却系数：每步 temp *= factor（应略小于 1.0）
+    pub factor: f64,
+}
+
+/// AMHB 算法参数配置
+#[derive(Debug, Clone, Deserialize)]
+pub struct AmhbConfig {
+    /// 算子池大小（总邻居数）
+    pub total_neighbors: usize,
+    /// 工作窃取阈值
+    pub steal_threshold: i32,
+    /// 最大迭代步数（达到后终止，即使温度未降完）
+    #[serde(default)]
+    pub total_steps: Option<usize>,
+    /// 初始温度
+    pub temp_start: f64,
+    /// 分段降温参数（按 threshold 从高到低排列）
+    pub cooling_segments: Vec<CoolingSegment>,
 }
 
 /// 简码级别配置（TOML 格式）
@@ -100,6 +136,7 @@ pub struct SimpleLevelConfig {
 
 impl Config {
     /// 从 config.toml 加载配置
+    #[allow(dead_code)]
     pub fn load() -> Self {
         Self::load_from_path("config.toml")
     }
@@ -285,6 +322,20 @@ impl Default for Config {
                 perturb_strength: 0.15,
                 reheat_factor: 1.25,
                 max_parts: 3,
+                total_neighbors: 0,
+                steal_threshold: 0,
+            },
+            amhb: AmhbConfig {
+                total_neighbors: 256,
+                steal_threshold: 1,
+                total_steps: None,
+                temp_start: 40.0,
+                cooling_segments: vec![
+                    CoolingSegment { threshold: 7.5, factor: 0.99999 },
+                    CoolingSegment { threshold: 1.75, factor: 0.999999 },
+                    CoolingSegment { threshold: 1.25, factor: 0.9999995 },
+                    CoolingSegment { threshold: 0.15, factor: 0.9999999625 },
+                ],
             },
             simple_levels: vec![
                 SimpleLevelConfig {

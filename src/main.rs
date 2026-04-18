@@ -3,17 +3,22 @@
 // =========================================================================
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::Local;
 use clap::{Parser, Subcommand};
 use rayon::prelude::*;
 
+mod amhb;
 mod annealing;
 mod calibrate;
+mod checkpoint;
 mod config;
 mod context;
 mod evaluator;
+mod keysoul;
 mod loader;
 mod output;
 mod schedule;
@@ -21,8 +26,12 @@ mod simple;
 mod types;
 mod validate;
 
-use crate::annealing::simulated_annealing;
+use crate::amhb::optimizer::{AmhbOptimizer, AmhbParameters};
+use crate::annealing::{random_init, simulated_annealing_resumable, SaResult};
 use crate::calibrate::calibrate_scales;
+use crate::checkpoint::{
+    save_checkpoint, load_checkpoint, Checkpoint, CHECKPOINT_FILENAME, CHECKPOINT_VERSION,
+};
 use crate::config::Config;
 use crate::context::OptContext;
 use crate::evaluator::Evaluator;
@@ -49,7 +58,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// 运行模拟退火优化（默认行为）
-    Optimize,
+    Optimize {
+        /// 使用 AMHB 算法 instead of SA
+        #[arg(short, long)]
+        amhb: bool,
+
+        /// 使用键魂当量模型替代 pair_equivalence.txt
+        #[arg(long)]
+        keysoul: bool,
+    },
 
     /// 根据 keymap 为汉字编码
     Encode {
@@ -88,9 +105,30 @@ enum Commands {
         #[arg(long)]
         simple: Option<String>,
 
+        /// 使用键魂当量模型替代 pair_equivalence.txt
+        #[arg(long)]
+        keysoul: bool,
+
         /// 评估输出文件
         #[arg(short = 'o', long, default_value = "output-evaluate.txt")]
         output: String,
+    },
+
+    /// 从检查点恢复优化（断点续算）
+    Resume {
+        /// 检查点文件路径
+        #[arg(short = 'f', long, default_value = "checkpoint.json")]
+        checkpoint: String,
+    },
+
+    /// 评估键魂当量（击键序列时间分析）
+    Keysoul {
+        /// 按键序列（如 "dkfj"）
+        sequence: String,
+
+        /// 显示每个键对的详细时间分解
+        #[arg(long)]
+        debug: bool,
     },
 }
 
@@ -119,6 +157,7 @@ fn main() {
             keydist,
             equiv,
             simple,
+            keysoul,
             output,
         }) => {
             let division_path = division.as_deref().unwrap_or(&cfg.files.splits);
@@ -131,10 +170,14 @@ fn main() {
                 keydist_path,
                 equiv_path,
                 simple.as_deref(),
+                keysoul,
                 &output,
             );
         }
-        Some(Commands::Optimize) | None => run_optimize(&cfg),
+        Some(Commands::Optimize { amhb, keysoul }) => run_optimize(&cfg, amhb, keysoul, &cli.config),
+        Some(Commands::Resume { checkpoint }) => run_resume(&cfg, &checkpoint),
+        Some(Commands::Keysoul { sequence, debug }) => run_keysoul(&sequence, debug),
+        None => run_optimize(&cfg, false, false, &cli.config),
     }
 }
 
@@ -227,13 +270,18 @@ fn run_evaluate(
     keydist_path: &str,
     equiv_path: &str,
     simple_path: Option<&str>,
+    use_keysoul: bool,
     output_path: &str,
 ) {
     println!("=== CodeGenie 评估模式 ===");
     println!("  拆分表: {}", division_path);
     println!("  键位映射: {}", keymap_path);
     println!("  键位分布: {}", keydist_path);
-    println!("  当量数据: {}", equiv_path);
+    if use_keysoul {
+        println!("  当量模型: 键魂当量 (keySoul v2.3)");
+    } else {
+        println!("  当量数据: {}", equiv_path);
+    }
     if let Some(sp) = simple_path {
         println!("  简码规则: {}", sp);
     }
@@ -274,6 +322,7 @@ fn run_evaluate(
         scale_config,
         simple_config,
         weights,
+        use_keysoul,
     );
 
     println!("  编码基数: {}", ctx.code_base);
@@ -590,7 +639,7 @@ fn build_evaluate_report(
 // optimize 子命令（原有优化流程）
 // =========================================================================
 
-fn run_optimize(cfg: &Config) {
+fn run_optimize(cfg: &Config, use_amhb: bool, use_keysoul: bool, cli_config_path: &str) {
     let start_time = Instant::now();
     println!("=== CodeGenie 码灵算法优化器 v10 ===");
 
@@ -598,13 +647,29 @@ fn run_optimize(cfg: &Config) {
     cfg.validate_weights();
 
     // 打印配置信息
-    println!(
-        "线程数: {}, 总步数: {}",
-        cfg.annealing.threads, cfg.annealing.total_steps
-    );
+    if use_amhb {
+        let steps_str = match cfg.amhb.total_steps {
+            Some(s) => format!("{}", s),
+            None => "无限制(由温度终止)".to_string(),
+        };
+        println!(
+            "线程数: {}, 总步数: {}",
+            cfg.annealing.threads, steps_str
+        );
+    } else {
+        println!(
+            "线程数: {}, 总步数: {}",
+            cfg.annealing.threads, cfg.annealing.total_steps
+        );
+    }
     println!(
         "初始温度: {}, 结束温度: {}",
-        cfg.annealing.temp_start, cfg.annealing.temp_end
+        if cfg.annealing.temp_start <= 0.0 {
+            "自动校准".to_string()
+        } else {
+            format!("{}", cfg.annealing.temp_start)
+        },
+        cfg.annealing.temp_end
     );
     println!("全局允许键位: {}", cfg.keys.allowed);
     println!(
@@ -636,6 +701,18 @@ fn run_optimize(cfg: &Config) {
         );
     }
     println!("用指分布输出顺序: {}", cfg.keys.display_order);
+    if use_keysoul {
+        println!("当量模型: 键魂当量 (keySoul v2.3)");
+    } else {
+        println!("当量模型: pair_equivalence.txt (陈一凡当量表)");
+    }
+
+    // 选择优化算法
+    if use_amhb {
+        println!("\n算法选择: AMHB (Adaptive Multi-candidate Heat Bath)");
+    } else {
+        println!("\n算法选择: SA (Simulated Annealing)");
+    }
 
     // 创建输出目录
     let timestamp = Local::now().format("%Y%m%d%H%M%S").to_string();
@@ -718,9 +795,10 @@ fn run_optimize(cfg: &Config) {
         temp_scale,
         simple_config.clone(),
         weights,
+        use_keysoul,
     );
 
-    let initial_assignment = annealing::smart_init(&temp_ctx, cfg);
+    let initial_assignment = random_init(&temp_ctx);
     let initial_eval = Evaluator::new(&temp_ctx, &initial_assignment);
     let initial_metrics = initial_eval.get_metrics(&temp_ctx);
     let initial_simple_metrics = initial_eval.get_simple_metrics(&temp_ctx);
@@ -865,6 +943,7 @@ fn run_optimize(cfg: &Config) {
         scale_config,
         simple_config,
         weights,
+        use_keysoul,
     );
 
     println!("\n  - 编码基数: {}", ctx.code_base);
@@ -872,19 +951,150 @@ fn run_optimize(cfg: &Config) {
 
     let root_usage = output::count_root_usage(&ctx);
 
-    // 并行执行模拟退火
+    // 并行执行优化
     println!("\n🚀 开始优化...");
+    println!("💡 提示: 按 Ctrl+C 可暂停优化并保存检查点，之后使用 resume 子命令恢复");
     let num_threads = cfg.annealing.threads;
-    let results: Vec<(Vec<u8>, f64, types::Metrics, SimpleMetrics)> = (0..num_threads)
-        .into_par_iter()
-        .map(|i| simulated_annealing(&ctx, cfg, i))
-        .collect();
 
-    let all_results: Vec<(usize, Vec<u8>, f64, types::Metrics, SimpleMetrics)> = results
-        .into_iter()
-        .enumerate()
-        .map(|(i, (a, s, m, sm))| (i, a, s, m, sm))
-        .collect();
+    // 设置 Ctrl+C 信号处理
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    {
+        let sf = Arc::clone(&stop_flag);
+        ctrlc_set_handler(move || {
+            eprintln!("\n[信号] 收到 Ctrl+C，等待各线程到达检查点...");
+            sf.store(true, Ordering::Relaxed);
+            // 不退出进程，让各线程检测到信号后优雅退出
+        });
+    }
+
+    let results: Vec<(Vec<u8>, f64, types::Metrics, SimpleMetrics)> = if use_amhb {
+        // AMHB 模式 — 分段指数降温（piecewise exponential cooling）
+        let segments = cfg.amhb.cooling_segments.clone();
+        let next_temp = move |t: f64, _iter: usize, _score: f64| -> f64 {
+            for seg in &segments {
+                if t > seg.threshold {
+                    return t * seg.factor;
+                }
+            }
+            -1.0 // 低于所有阈值，终止
+        };
+
+        let param = AmhbParameters {
+            max_iterations: cfg.amhb.total_steps.unwrap_or(u64::MAX as usize) as u64,
+            temp_start: cfg.amhb.temp_start,
+            total_neighbors: cfg.amhb.total_neighbors,
+            steal_threshold: cfg.amhb.steal_threshold,
+        };
+
+        let mut optimizer = AmhbOptimizer::new(
+            &ctx,
+            num_threads,
+            true,
+            cfg.amhb.total_neighbors,
+            cfg.amhb.steal_threshold,
+        );
+        optimizer.solve(&ctx, param, next_temp, &stop_flag);
+
+        // 从 optimizer 获取最佳结果
+        let amhb_result = vec![(optimizer.best_assignment.clone(), optimizer.best_score, types::Metrics::default(), SimpleMetrics::default())];
+
+        // 若被中断，直接输出当前最优并退出（AMHB 暂不支持断点续算）
+        if stop_flag.load(Ordering::Relaxed) {
+            let eval = Evaluator::new(&ctx, &optimizer.best_assignment);
+            let m = eval.get_metrics(&ctx);
+            let sm = eval.get_simple_metrics(&ctx);
+            println!("\n⏸️  优化已暂停（AMHB 模式不支持断点续算）");
+            println!("   当前最优得分: {:.4}", optimizer.best_score);
+            println!("   重码数: {}", m.collision_count);
+            // 仍然保存当前最优结果
+            let all_results = vec![(0usize, optimizer.best_assignment.clone(), optimizer.best_score, m, sm)];
+            let output_dir_ref = &output_dir;
+            let root_usage_ref = &root_usage;
+            save_results(&ctx, &optimizer.best_assignment, optimizer.best_score, &m, &sm, output_dir_ref, root_usage_ref);
+            save_summary(cfg, &all_results, 0, output_dir_ref, start_time.elapsed());
+            println!("\n当前最优结果已保存至 {}/", output_dir);
+            return;
+        }
+
+        amhb_result
+    } else {
+        // SA 模式 — 带断点续算支持
+        let sa_results: Vec<SaResult> = (0..num_threads)
+            .into_par_iter()
+            .map(|i| simulated_annealing_resumable(&ctx, cfg, i, &stop_flag, None, None))
+            .collect();
+
+        // 检查是否被中断
+        let was_interrupted = sa_results.iter().any(|r| r.checkpoint.is_some());
+        if was_interrupted {
+            // 收集所有线程检查点并保存
+            let thread_checkpoints: Vec<_> = sa_results
+                .iter()
+                .filter_map(|r| r.checkpoint.clone())
+                .collect();
+
+            // 获取自动校准的温度参数（使用线程 0 的值）
+            let (at_start, at_comfort) = sa_results
+                .first()
+                .map(|r| (r.actual_temp_start, r.actual_comfort_temp))
+                .unwrap_or((cfg.annealing.temp_start, cfg.annealing.comfort_temp));
+
+            let ckpt = Checkpoint {
+                version: CHECKPOINT_VERSION,
+                timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                config_path: cli_config_path.to_string(),
+                scale_config,
+                actual_temp_start: at_start,
+                actual_comfort_temp: at_comfort,
+                total_steps: cfg.annealing.total_steps,
+                num_threads,
+                use_keysoul,
+                threads: thread_checkpoints,
+            };
+
+            let ckpt_path = std::path::Path::new(CHECKPOINT_FILENAME);
+            match save_checkpoint(&ckpt, ckpt_path) {
+                Ok(()) => {
+                    println!("\n✅ 检查点已保存至 {}", CHECKPOINT_FILENAME);
+                    println!("   可使用以下命令恢复优化:");
+                    println!("   cargo run --release -- resume -f {}", CHECKPOINT_FILENAME);
+                }
+                Err(e) => {
+                    eprintln!("\n❌ 保存检查点失败: {}", e);
+                }
+            }
+
+            // 即使被中断，也输出当前最优结果
+            let best_so_far = sa_results
+                .iter()
+                .min_by(|a, b| a.score.partial_cmp(&b.score).unwrap())
+                .unwrap();
+
+            println!("\n⏸️  优化已暂停");
+            println!("   当前最优得分: {:.4}", best_so_far.score);
+            println!("   重码数: {}", best_so_far.metrics.collision_count);
+            return;
+        }
+
+        sa_results
+            .into_iter()
+            .map(|r| (r.assignment, r.score, r.metrics, r.simple_metrics))
+            .collect()
+    };
+
+    // SA 模式需要额外处理结果
+    let all_results: Vec<(usize, Vec<u8>, f64, types::Metrics, SimpleMetrics)> = if use_amhb {
+        // AMHB 只有一个结果（但我们有多线程的 assignment，取最优）
+        let best = results.into_iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap();
+        vec![(0, best.0, best.1, best.2, best.3)]
+    } else {
+        // SA 结果处理
+        results
+            .into_iter()
+            .enumerate()
+            .map(|(i, (a, s, m, sm))| (i, a, s, m, sm))
+            .collect()
+    };
 
     // 找出最优结果
     let (best_thread, best_assignment, best_score, best_metrics, best_simple_metrics) = all_results
@@ -951,4 +1161,374 @@ fn run_optimize(cfg: &Config) {
     println!("  - output-*.txt             全局最优结果");
     println!("  - output-simple-codes.txt  简码分配");
     println!("  - thread-XX/               各线程结果");
+}
+
+/// 封装 ctrlc 信号处理设置
+fn ctrlc_set_handler<F: Fn() + Send + 'static>(handler: F) {
+    ctrlc::set_handler(handler).expect("无法设置 Ctrl+C 信号处理");
+}
+// =========================================================================
+// resume 子命令 — 从检查点恢复优化
+// =========================================================================
+
+fn run_resume(cfg: &Config, checkpoint_path: &str) {
+    let start_time = Instant::now();
+    println!("=== CodeGenie 断点续算模式 ===");
+    println!("  检查点文件: {}", checkpoint_path);
+
+    // 加载检查点
+    let ckpt = match load_checkpoint(std::path::Path::new(checkpoint_path)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("❌ {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    println!("  保存时间: {}", ckpt.timestamp);
+    println!("  原配置文件: {}", ckpt.config_path);
+    println!("  线程数: {}", ckpt.num_threads);
+    println!("  总步数: {}", ckpt.total_steps);
+    println!(
+        "  各线程进度: {}",
+        ckpt.threads
+            .iter()
+            .map(|t| format!("T{}@{}", t.thread_id, t.current_step))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    // 验证线程数匹配
+    if ckpt.num_threads != cfg.annealing.threads {
+        println!(
+            "⚠️  注意: 配置文件线程数({})与检查点线程数({})不同，以检查点为准",
+            cfg.annealing.threads, ckpt.num_threads
+        );
+    }
+
+    // 验证配置
+    cfg.validate_weights();
+
+    // ==================== 加载数据 ====================
+    let (fixed_roots, constrained) = loader::load_fixed(&cfg.files.fixed);
+    let dynamic_groups = loader::load_dynamic(&cfg.files.dynamic, &constrained, &cfg.keys.allowed);
+    let splits = loader::load_splits(&cfg.files.splits);
+    let equiv_table = loader::load_pair_equivalence(&cfg.files.pair_equiv);
+    let key_dist_config = loader::load_key_distribution(&cfg.files.key_dist);
+
+    let simple_config = if cfg.weights.simple_code.enabled {
+        cfg.get_simple_code_config()
+    } else {
+        SimpleCodeConfig { levels: vec![] }
+    };
+
+    let weights = cfg.get_weight_config();
+
+    // 使用检查点中保存的 ScaleConfig（避免重新校准）
+    let ctx = OptContext::new(
+        &splits,
+        &fixed_roots,
+        &dynamic_groups,
+        equiv_table,
+        key_dist_config,
+        ckpt.scale_config,
+        simple_config,
+        weights,
+        ckpt.use_keysoul,
+    );
+
+    println!("\n  数据加载完毕:");
+    println!("  - 字根组: {}", ctx.num_groups);
+    println!("  - 汉字数: {}", ctx.char_infos.len());
+    println!("  - 编码空间: {}", ctx.code_space);
+
+    // 验证 assignment 维度
+    for tc in &ckpt.threads {
+        if tc.assignment.len() != ctx.num_groups {
+            eprintln!(
+                "❌ 线程 {} 的 assignment 长度({})与当前字根组数({})不匹配，数据可能已更改",
+                tc.thread_id,
+                tc.assignment.len(),
+                ctx.num_groups
+            );
+            std::process::exit(1);
+        }
+    }
+
+    let root_usage = output::count_root_usage(&ctx);
+
+    // 创建输出目录
+    let timestamp = Local::now().format("%Y%m%d%H%M%S").to_string();
+    let output_dir = format!("output-{}", timestamp);
+    std::fs::create_dir_all(&output_dir).expect("无法创建输出目录");
+    println!("  输出目录: {}", output_dir);
+
+    // 设置 Ctrl+C 信号处理
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    {
+        let sf = Arc::clone(&stop_flag);
+        ctrlc_set_handler(move || {
+            sf.store(true, Ordering::Relaxed);
+        });
+    }
+
+    // 温度调度参数
+    let schedule_override = if ckpt.actual_temp_start > 0.0 {
+        Some((ckpt.actual_temp_start, ckpt.actual_comfort_temp))
+    } else {
+        None
+    };
+
+    println!("\n🚀 恢复优化...");
+    println!("💡 提示: 再次按 Ctrl+C 可暂停并保存新的检查点");
+
+    let num_threads = ckpt.threads.len();
+    let sa_results: Vec<SaResult> = ckpt
+        .threads
+        .par_iter()
+        .map(|tc| {
+            simulated_annealing_resumable(
+                &ctx,
+                cfg,
+                tc.thread_id,
+                &stop_flag,
+                Some(tc),
+                schedule_override,
+            )
+        })
+        .collect();
+
+    // 检查是否再次被中断
+    let was_interrupted = sa_results.iter().any(|r| r.checkpoint.is_some());
+    if was_interrupted {
+        let thread_checkpoints: Vec<_> = sa_results
+            .iter()
+            .filter_map(|r| r.checkpoint.clone())
+            .collect();
+
+        let (at_start, at_comfort) = sa_results
+            .first()
+            .map(|r| (r.actual_temp_start, r.actual_comfort_temp))
+            .unwrap_or((ckpt.actual_temp_start, ckpt.actual_comfort_temp));
+
+        let new_ckpt = Checkpoint {
+            version: CHECKPOINT_VERSION,
+            timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            config_path: ckpt.config_path.clone(),
+            scale_config: ckpt.scale_config,
+            actual_temp_start: at_start,
+            actual_comfort_temp: at_comfort,
+            total_steps: ckpt.total_steps,
+            num_threads,
+            use_keysoul: ckpt.use_keysoul,
+            threads: thread_checkpoints,
+        };
+
+        let ckpt_path = std::path::Path::new(CHECKPOINT_FILENAME);
+        match save_checkpoint(&new_ckpt, ckpt_path) {
+            Ok(()) => {
+                println!("\n✅ 新检查点已保存至 {}", CHECKPOINT_FILENAME);
+                println!("   可使用以下命令继续恢复:");
+                println!("   cargo run --release -- resume -f {}", CHECKPOINT_FILENAME);
+            }
+            Err(e) => {
+                eprintln!("\n❌ 保存检查点失败: {}", e);
+            }
+        }
+
+        let best_so_far = sa_results
+            .iter()
+            .min_by(|a, b| a.score.partial_cmp(&b.score).unwrap())
+            .unwrap();
+
+        println!("\n⏸️  优化已暂停");
+        println!("   当前最优得分: {:.4}", best_so_far.score);
+        println!("   重码数: {}", best_so_far.metrics.collision_count);
+        return;
+    }
+
+    // 正常完成 — 输出结果
+    let all_results: Vec<(usize, Vec<u8>, f64, types::Metrics, SimpleMetrics)> = sa_results
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| (i, r.assignment, r.score, r.metrics, r.simple_metrics))
+        .collect();
+
+    let (best_thread, best_assignment, best_score, best_metrics, best_simple_metrics) = all_results
+        .iter()
+        .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap())
+        .map(|(tid, a, s, m, sm)| (*tid, a.clone(), *s, *m, *sm))
+        .unwrap();
+
+    let elapsed = start_time.elapsed();
+
+    let m = best_metrics;
+    let sm = best_simple_metrics;
+    println!("\n=================================");
+    println!("🏆 最优结果 (线程 {}):", best_thread);
+    println!("   综合得分: {:.4}", best_score);
+    println!("   「全码」重码数: {}", m.collision_count);
+    println!("   「全码」重码率: {:.6}%", m.collision_rate * 100.0);
+    println!("   「全码」加权键均当量: {:.4}", m.equiv_mean);
+    println!("   「全码」当量变异系数(CV): {:.4}", m.equiv_cv);
+    println!("   「全码」用指分布偏差(L2): {:.4}", m.dist_deviation);
+    if cfg.weights.simple_code.enabled {
+        println!("---------------------------------");
+        println!("   「简码」重码数: {}", sm.collision_count);
+        println!("   「简码」重码率: {:.6}%", sm.collision_rate * 100.0);
+        println!(
+            "   「简码」覆盖率: {:.4}%",
+            sm.weighted_freq_coverage * 100.0
+        );
+        println!("   「简码」加权当量: {:.4}", sm.equiv_mean);
+        println!("   「简码」分布偏差: {:.4}", sm.dist_deviation);
+    }
+    println!("⏱️ 总耗时: {:?}", elapsed);
+    println!("=================================");
+
+    // 保存结果
+    println!("\n📁 保存所有线程结果...");
+    for (tid, assignment, score, metrics, smetrics) in &all_results {
+        save_thread_results(
+            &ctx,
+            assignment,
+            *score,
+            metrics,
+            smetrics,
+            *tid,
+            &output_dir,
+            &root_usage,
+        );
+    }
+
+    save_results(
+        &ctx,
+        &best_assignment,
+        best_score,
+        &best_metrics,
+        &best_simple_metrics,
+        &output_dir,
+        &root_usage,
+    );
+    save_summary(cfg, &all_results, best_thread, &output_dir, elapsed);
+
+    // 清理检查点文件
+    let ckpt_file = std::path::Path::new(checkpoint_path);
+    if ckpt_file.exists() {
+        let _ = std::fs::remove_file(ckpt_file);
+        println!("🗑️  已清理检查点文件 {}", checkpoint_path);
+    }
+
+    println!("\n所有结果已保存至 {}/", output_dir);
+    println!("  - summary.txt              汇总排名");
+    println!("  - output-*.txt             全局最优结果");
+    println!("  - output-simple-codes.txt  简码分配");
+    println!("  - thread-XX/               各线程结果");
+}
+
+// =========================================================================
+// keysoul 子命令
+// =========================================================================
+
+fn run_keysoul(sequence: &str, debug: bool) {
+    use crate::keysoul::global_model;
+
+    // 中文字符双宽，ASCII 单宽
+    fn dw(s: &str) -> usize {
+        s.chars().map(|c| {
+            let cp = c as u32;
+            if (0x1100..=0x115F).contains(&cp)
+                || (0x2E80..=0x303F).contains(&cp)
+                || (0x3040..=0x33FF).contains(&cp)
+                || (0x3400..=0x4DBF).contains(&cp)
+                || (0x4E00..=0x9FFF).contains(&cp)
+                || (0xAC00..=0xD7AF).contains(&cp)
+                || (0xF900..=0xFAFF).contains(&cp)
+                || (0xFE10..=0xFE6F).contains(&cp)
+                || (0xFF00..=0xFFEF).contains(&cp)
+            { 2 } else { 1 }
+        }).sum()
+    }
+    // 右填充到显示宽度 w
+    let pr = |s: &str, w: usize| -> String {
+        let d = dw(s);
+        if d >= w { s.to_string() } else { format!("{}{}", s, " ".repeat(w - d)) }
+    };
+    // 左填充到显示宽度 w
+    let pl = |s: &str, w: usize| -> String {
+        let d = dw(s);
+        if d >= w { s.to_string() } else { format!("{}{}", " ".repeat(w - d), s) }
+    };
+
+    let model = global_model();
+
+    if !debug {
+        match model.sequence_time(sequence) {
+            t if t < 0.0 => eprintln!("错误：序列包含未知键"),
+            t => println!("序列: {}\n总时间: {:.2} 毫秒 = {:.4} 秒", sequence, t, t / 1000.0),
+        }
+        return;
+    }
+
+    match model.sequence_time_debug(sequence) {
+        None => eprintln!("错误：序列包含未知键"),
+        Some((total, left_time, right_time, pairs)) => {
+            println!("\n  序列: {}", sequence);
+            println!("  总时间: {:.2} 毫秒 = {:.4} 秒\n", total, total / 1000.0);
+
+            // 各列显示宽度（按终端列数）
+            let (c0, c1, c2) = (8, 10, 17);  // 键对, 分类, 手指路径
+            let (c3, c4, c5, c6) = (6, 6, 6, 6);  // 神经, 原始, 折扣, 移动
+            let (c7, c8, c9) = (6, 6, 7);  // 耦合, 跨行, 同指跨
+            let (c10, c11, c12, c13) = (6, 6, 6, 6);  // 小指, 伸展, 滚动, 连击
+            let (c14, c15, c16) = (4, 7, 7);  // 次, 联动, 合计
+
+            println!("{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
+                pr("键对", c0), pr("分类", c1), pr("手指路径", c2),
+                pl("神经", c3), pl("原始", c4), pl("折扣", c5), pl("移动", c6),
+                pl("耦合", c7), pl("跨行", c8), pl("同指跨", c9),
+                pl("小指", c10), pl("伸展", c11), pl("滚动", c12), pl("连击", c13),
+                pl("次", c14), pl("联动", c15), pl("合计", c16));
+
+            let total_w = c0+c1+c2+c3+c4+c5+c6+c7+c8+c9+c10+c11+c12+c13+c14+c15+c16;
+            let sep = "─".repeat(total_w);
+            println!("{}", sep);
+
+            for p in &pairs {
+                let pair_str = format!("{}→{}", p.prev_ch, p.curr_ch);
+                let discount_str = match p.move_discount {
+                    Some(d) => format!("{:.2}", d),
+                    None => "—".to_string(),
+                };
+                println!("{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
+                    pr(&pair_str, c0),
+                    pr(p.category, c1),
+                    pr(&p.finger_path, c2),
+                    pl(&format!("{:.1}", p.t_neural), c3),
+                    pl(&format!("{:.1}", p.t_move_raw), c4),
+                    pl(&discount_str, c5),
+                    pl(&format!("{:.1}", p.t_move), c6),
+                    pl(&format!("{:.1}", p.t_couple), c7),
+                    pl(&format!("{:.1}", p.t_row), c8),
+                    pl(&format!("{:.1}", p.t_sf_jump), c9),
+                    pl(&format!("{:.1}", p.t_pinky), c10),
+                    pl(&format!("{:.1}", p.t_stretch), c11),
+                    pl(&format!("{:.1}", p.t_roll), c12),
+                    pl(&format!("{:.1}", p.t_repeat), c13),
+                    pl(&format!("{}", p.repeat_count), c14),
+                    pl(&format!("{:+.1}", p.tendon_delta), c15),
+                    pl(&format!("{:.1}", p.total), c16),
+                );
+                if let Some(note) = &p.note {
+                    println!("   └─ {}", note);
+                }
+            }
+
+            println!("{}", sep);
+            println!("  ⊙ 逐步累加总计:   {:.2} 毫秒", pairs.iter().map(|p| p.total).sum::<f64>());
+            println!("  ⊙ 左手子序列下界: {:.2} 毫秒", left_time);
+            println!("  ⊙ 右手子序列下界: {:.2} 毫秒", right_time);
+            println!("  ★ 最终时间:       {:.2} 毫秒", total);
+        }
+    }
 }

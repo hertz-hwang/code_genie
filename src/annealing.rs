@@ -4,8 +4,11 @@
 
 use rand::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
+use crate::checkpoint::ThreadCheckpoint;
 use crate::config::Config;
 use crate::context::OptContext;
 use crate::evaluator::Evaluator;
@@ -317,9 +320,6 @@ fn try_triple_swap(
     }
 
     let old_score = evaluator.get_score(ctx);
-    let needs_simple = evaluator.has_simple_impact(ctx, g1)
-        || evaluator.has_simple_impact(ctx, g2)
-        || evaluator.has_simple_impact(ctx, g3);
 
     // 更新 key_weighted_usage
     for &(gi, old_k, new_k) in &[(g1, k1, k2), (g2, k2, k3), (g3, k3, k1)] {
@@ -347,10 +347,6 @@ fn try_triple_swap(
         for &ci in &ctx.group_to_chars[gi] {
             evaluator.update_char(ctx, assignment, ci);
         }
-    }
-
-    if needs_simple {
-        evaluator.rebuild_simple(ctx, assignment);
     }
 
     evaluator.score_dirty = true;
@@ -386,10 +382,6 @@ fn try_triple_swap(
             for &ci in &ctx.group_to_chars[gi] {
                 evaluator.update_char(ctx, assignment, ci);
             }
-        }
-
-        if needs_simple {
-            evaluator.rebuild_simple(ctx, assignment);
         }
 
         evaluator.cached_score = old_score;
@@ -511,8 +503,6 @@ fn coordinate_descent(ctx: &OptContext, init: Vec<u8>) -> (Vec<u8>, f64) {
                 }
 
                 // 增量前向：移动到候选键
-                let needs_simple = evaluator.has_simple_impact(ctx, gi);
-
                 for &ci in &ctx.group_to_chars[gi] {
                     let freq_f = ctx.char_infos[ci].frequency as f64;
                     for &p in &ctx.char_infos[ci].parts {
@@ -527,9 +517,6 @@ fn coordinate_descent(ctx: &OptContext, init: Vec<u8>) -> (Vec<u8>, f64) {
                 assignment[gi] = k;
                 for &ci in &ctx.group_to_chars[gi] {
                     evaluator.update_char(ctx, &assignment, ci);
-                }
-                if needs_simple {
-                    evaluator.rebuild_simple(ctx, &assignment);
                 }
                 evaluator.score_dirty = true;
                 let score = evaluator.get_score(ctx);
@@ -553,16 +540,12 @@ fn coordinate_descent(ctx: &OptContext, init: Vec<u8>) -> (Vec<u8>, f64) {
                 for &ci in &ctx.group_to_chars[gi] {
                     evaluator.update_char(ctx, &assignment, ci);
                 }
-                if needs_simple {
-                    evaluator.rebuild_simple(ctx, &assignment);
-                }
                 evaluator.cached_score = current_score;
                 evaluator.score_dirty = false;
             }
 
             if best_key != current_key {
                 // 应用最优移动
-                let needs_simple = evaluator.has_simple_impact(ctx, gi);
                 for &ci in &ctx.group_to_chars[gi] {
                     let freq_f = ctx.char_infos[ci].frequency as f64;
                     for &p in &ctx.char_infos[ci].parts {
@@ -576,15 +559,15 @@ fn coordinate_descent(ctx: &OptContext, init: Vec<u8>) -> (Vec<u8>, f64) {
                 for &ci in &ctx.group_to_chars[gi] {
                     evaluator.update_char(ctx, &assignment, ci);
                 }
-                if needs_simple {
-                    evaluator.rebuild_simple(ctx, &assignment);
-                }
                 evaluator.score_dirty = true;
                 improved = true;
             }
         }
     }
 
+    // 坐标下降完成后做一次简码重建，确保最终得分包含简码
+    evaluator.rebuild_simple(ctx, &assignment);
+    evaluator.score_dirty = true;
     let score = evaluator.get_score(ctx);
     (assignment, score)
 }
@@ -600,8 +583,8 @@ pub fn multi_start_init(ctx: &OptContext, cfg: &Config, thread_id: usize) -> Vec
         return vec![];
     }
 
-    let n_candidates: usize = if n < 100 { 50 } else if n < 1000 { 50 } else { 30 };
-    let warmup_steps = (n * 30).max(2000).min(50_000);
+    let n_candidates: usize = if n < 100 { 16 } else if n < 1000 { 12 } else { 8 };
+    let warmup_steps = (n * 20).max(1000).min(20_000);
 
     let mut best_assignment: Option<Vec<u8>> = None;
     let mut best_score = f64::MAX;
@@ -660,47 +643,306 @@ pub fn multi_start_init(ctx: &OptContext, cfg: &Config, thread_id: usize) -> Vec
     best
 }
 
+#[allow(dead_code)]
 pub fn smart_init(ctx: &OptContext, cfg: &Config) -> Vec<u8> {
     multi_start_init(ctx, cfg, usize::MAX)
+}
+
+/// 纯随机初始化（供校准阶段使用，无需精确优化）
+pub fn random_init(ctx: &OptContext) -> Vec<u8> {
+    let mut rng = thread_rng();
+    random_valid_init(ctx, &mut rng)
+}
+
+// =========================================================================
+// 🌡️ 起始温度自动校准
+// =========================================================================
+
+/// 采样随机 move/swap 操作的 delta 值，计算使初始接受率达到目标值的起始温度。
+///
+/// 原理：对于 Boltzmann 接受准则 P = exp(-Δ/T)，给定目标接受率 p，
+/// 取采样到的恶化 delta 的中位数 Δ_med，解出 T = -Δ_med / ln(p)。
+///
+/// 参数：
+/// - `target_accept_rate`: 目标初始接受率，推荐 0.3-0.5
+/// - `n_samples`: 采样次数，推荐 2000-5000
+pub fn calibrate_temperature(
+    ctx: &OptContext,
+    assignment: &[u8],
+    target_accept_rate: f64,
+    n_samples: usize,
+) -> f64 {
+    let mut rng = thread_rng();
+    let n_groups = assignment.len();
+    if n_groups == 0 {
+        return 1.0;
+    }
+
+    let mut assignment = assignment.to_vec();
+    let mut evaluator = Evaluator::new(ctx, &assignment);
+    let mut deltas: Vec<f64> = Vec::with_capacity(n_samples);
+
+    for i in 0..n_samples {
+        let base_score = evaluator.get_score(ctx);
+
+        // 交替使用 move 和 swap 采样
+        if i % 3 == 0 && n_groups >= 2 {
+            // swap 采样
+            let r1 = rng.gen_range(0..n_groups);
+            let r2 = rng.gen_range(0..n_groups - 1);
+            let r2 = if r2 >= r1 { r2 + 1 } else { r2 };
+            let k1 = assignment[r1];
+            let k2 = assignment[r2];
+            if k1 != k2
+                && ctx.groups[r1].allowed_keys.contains(&k2)
+                && ctx.groups[r2].allowed_keys.contains(&k1)
+            {
+                // 执行 swap
+                let gfs1 = ctx.group_freq_sum[r1];
+                let gfs2 = ctx.group_freq_sum[r2];
+                evaluator.key_weighted_usage[k1 as usize] -= gfs1;
+                evaluator.key_weighted_usage[k2 as usize] += gfs1;
+                evaluator.key_weighted_usage[k2 as usize] -= gfs2;
+                evaluator.key_weighted_usage[k1 as usize] += gfs2;
+
+                assignment[r1] = k2;
+                assignment[r2] = k1;
+                for &ci in &ctx.group_to_chars[r1] {
+                    evaluator.update_char(ctx, &assignment, ci);
+                }
+                for &ci in &ctx.group_to_chars[r2] {
+                    evaluator.update_char(ctx, &assignment, ci);
+                }
+                evaluator.score_dirty = true;
+                let new_score = evaluator.get_score(ctx);
+                let delta = new_score - base_score;
+                if delta > 0.0 {
+                    deltas.push(delta);
+                }
+
+                // 回滚
+                evaluator.key_weighted_usage[k2 as usize] -= gfs1;
+                evaluator.key_weighted_usage[k1 as usize] += gfs1;
+                evaluator.key_weighted_usage[k1 as usize] -= gfs2;
+                evaluator.key_weighted_usage[k2 as usize] += gfs2;
+                assignment[r1] = k1;
+                assignment[r2] = k2;
+                for &ci in &ctx.group_to_chars[r1] {
+                    evaluator.update_char(ctx, &assignment, ci);
+                }
+                for &ci in &ctx.group_to_chars[r2] {
+                    evaluator.update_char(ctx, &assignment, ci);
+                }
+                evaluator.cached_score = base_score;
+                evaluator.score_dirty = false;
+            }
+        } else {
+            // move 采样
+            let r = rng.gen_range(0..n_groups);
+            let allowed = &ctx.groups[r].allowed_keys;
+            let new_key = allowed[rng.gen_range(0..allowed.len())];
+            let old_key = assignment[r];
+            if new_key == old_key {
+                continue;
+            }
+
+            let gfs = ctx.group_freq_sum[r];
+            evaluator.key_weighted_usage[old_key as usize] -= gfs;
+            evaluator.key_weighted_usage[new_key as usize] += gfs;
+
+            assignment[r] = new_key;
+            for &ci in &ctx.group_to_chars[r] {
+                evaluator.update_char(ctx, &assignment, ci);
+            }
+            evaluator.score_dirty = true;
+            let new_score = evaluator.get_score(ctx);
+            let delta = new_score - base_score;
+            if delta > 0.0 {
+                deltas.push(delta);
+            }
+
+            // 回滚
+            evaluator.key_weighted_usage[new_key as usize] -= gfs;
+            evaluator.key_weighted_usage[old_key as usize] += gfs;
+            assignment[r] = old_key;
+            for &ci in &ctx.group_to_chars[r] {
+                evaluator.update_char(ctx, &assignment, ci);
+            }
+            evaluator.cached_score = base_score;
+            evaluator.score_dirty = false;
+        }
+    }
+
+    if deltas.is_empty() {
+        return 0.01; // 极端情况：所有移动都不恶化
+    }
+
+    deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    // 用中位数 delta 和目标接受率反解温度: T = -Δ_med / ln(p)
+    let median_idx = deltas.len() / 2;
+    let delta_median = deltas[median_idx];
+
+    // 同时看 P75 delta 用于参考
+    let p75_idx = deltas.len() * 3 / 4;
+    let delta_p75 = deltas[p75_idx];
+
+    // T = -delta / ln(accept_rate)，ln(accept_rate) 为负数所以 T 为正
+    let t_from_median = -delta_median / target_accept_rate.ln();
+    let t_from_p75 = -delta_p75 / target_accept_rate.ln();
+
+    // 使用中位数作为主校准值
+    let calibrated_temp = t_from_median;
+
+    println!("  🌡️ 温度校准 (采样 {} 次, {} 个恶化 delta):", n_samples, deltas.len());
+    println!(
+        "    delta 分布: min={:.6}, P25={:.6}, median={:.6}, P75={:.6}, max={:.6}",
+        deltas[0],
+        deltas[deltas.len() / 4],
+        delta_median,
+        delta_p75,
+        deltas[deltas.len() - 1]
+    );
+    println!(
+        "    目标接受率: {:.0}% → 校准 T_start={:.6} (P75参考: {:.6})",
+        target_accept_rate * 100.0, calibrated_temp, t_from_p75
+    );
+
+    calibrated_temp
 }
 
 // =========================================================================
 // 🔥 模拟退火主循环
 // =========================================================================
 
+/// SA 主循环返回类型
+pub struct SaResult {
+    pub assignment: Vec<u8>,
+    pub score: f64,
+    pub metrics: Metrics,
+    pub simple_metrics: SimpleMetrics,
+    /// 若被中断，保存线程检查点
+    pub checkpoint: Option<ThreadCheckpoint>,
+    /// 自动校准得到的起始温度（0 表示未校准）
+    pub actual_temp_start: f64,
+    /// 自动校准得到的舒适温度（0 表示未校准）
+    pub actual_comfort_temp: f64,
+}
+
 pub fn simulated_annealing(
     ctx: &OptContext,
     cfg: &Config,
     thread_id: usize,
 ) -> (Vec<u8>, f64, Metrics, SimpleMetrics) {
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let result = simulated_annealing_resumable(ctx, cfg, thread_id, &stop_flag, None, None);
+    (result.assignment, result.score, result.metrics, result.simple_metrics)
+}
+
+/// 可断点续算的 SA 主循环
+///
+/// - `stop_flag`: 外部信号，为 true 时主循环提前退出并生成检查点
+/// - `resume`: 若非 None，从该检查点恢复继续
+/// - `schedule_override`: 覆盖温度调度参数 (actual_temp_start, actual_comfort_temp)
+pub fn simulated_annealing_resumable(
+    ctx: &OptContext,
+    cfg: &Config,
+    thread_id: usize,
+    stop_flag: &Arc<AtomicBool>,
+    resume: Option<&ThreadCheckpoint>,
+    schedule_override: Option<(f64, f64)>,
+) -> SaResult {
     let mut rng = thread_rng();
 
-    let mut assignment = multi_start_init(ctx, cfg, thread_id);
-    let mut evaluator = Evaluator::new(ctx, &assignment);
+    // ---- 初始化或从检查点恢复 ----
+    let start_step;
+    let mut assignment;
+    let mut best_assignment;
+    let mut best_score;
+    let mut best_metrics;
+    let mut best_simple_metrics;
+    let mut temp_multiplier;
+    let mut steps_since_improve;
+    let mut last_best_score;
 
-    let mut best_assignment = assignment.clone();
-    let mut best_score = evaluator.get_score(ctx);
-    let mut best_metrics = evaluator.get_metrics(ctx);
-    let mut best_simple_metrics = evaluator.get_simple_metrics(ctx);
+    if let Some(ckpt) = resume {
+        // 从检查点恢复
+        assignment = ckpt.assignment.clone();
+        best_assignment = ckpt.best_assignment.clone();
+        best_score = ckpt.best_score;
+        best_metrics = ckpt.best_metrics;
+        best_simple_metrics = ckpt.best_simple_metrics;
+        start_step = ckpt.current_step;
+        temp_multiplier = ckpt.temp_multiplier;
+        steps_since_improve = ckpt.steps_since_improve;
+        last_best_score = ckpt.last_best_score;
 
-    if thread_id == 0 {
-        let m = &best_metrics;
-        println!(
-            "   [T0] 初始化完成 | 得分: {:.4} | 重码: {} 重码率: {:.4}% 当量: {:.4}",
-            best_score, m.collision_count, m.collision_rate * 100.0, m.equiv_mean
-        );
+        if thread_id == 0 {
+            println!(
+                "   [T0] 从检查点恢复 | 步数: {}/{} | 最优得分: {:.4}",
+                start_step, cfg.annealing.total_steps, best_score
+            );
+        }
+    } else {
+        // 正常初始化
+        assignment = multi_start_init(ctx, cfg, thread_id);
+        best_assignment = assignment.clone();
+        start_step = 0;
+        temp_multiplier = 1.0;
+        steps_since_improve = 0;
+
+        let mut evaluator_init = Evaluator::new(ctx, &assignment);
+        best_score = evaluator_init.get_score(ctx);
+        best_metrics = evaluator_init.get_metrics(ctx);
+        best_simple_metrics = evaluator_init.get_simple_metrics(ctx);
+        last_best_score = best_score;
+
+        if thread_id == 0 {
+            let m = &best_metrics;
+            println!(
+                "   [T0] 初始化完成 | 得分: {:.4} | 重码: {} 重码率: {:.4}% 当量: {:.4}",
+                best_score, m.collision_count, m.collision_rate * 100.0, m.equiv_mean
+            );
+        }
     }
+
+    let mut evaluator = Evaluator::new(ctx, &assignment);
 
     let steps = cfg.annealing.total_steps;
     let n_groups = assignment.len();
     if n_groups == 0 {
-        return (best_assignment, best_score, best_metrics, best_simple_metrics);
+        return SaResult {
+            assignment: best_assignment,
+            score: best_score,
+            metrics: best_metrics,
+            simple_metrics: best_simple_metrics,
+            checkpoint: None,
+            actual_temp_start: 0.0,
+            actual_comfort_temp: 0.0,
+        };
     }
 
+    // 温度校准：优先使用 schedule_override，否则自动校准
+    let (actual_temp_start, actual_comfort_temp) = if let Some((ts, ct)) = schedule_override {
+        (ts, ct)
+    } else if cfg.annealing.temp_start <= 0.0 {
+        let calibrated = calibrate_temperature(ctx, &assignment, 0.4, 3000);
+        let comfort = calibrated * 0.2;
+        if thread_id == 0 {
+            println!(
+                "    自动 comfort_temp={:.6} (T_start × 0.2)",
+                comfort
+            );
+        }
+        (calibrated, comfort)
+    } else {
+        (cfg.annealing.temp_start, cfg.annealing.comfort_temp)
+    };
+
     let schedule = TemperatureSchedule::build(
-        cfg.annealing.temp_start,
+        actual_temp_start,
         cfg.annealing.temp_end,
-        cfg.annealing.comfort_temp,
+        actual_comfort_temp,
         cfg.annealing.comfort_width,
         cfg.annealing.comfort_slowdown,
     );
@@ -709,16 +951,13 @@ pub fn simulated_annealing(
         schedule.print_preview(steps);
     }
 
-    let mut temp_multiplier = 1.0f64;
+    // temp_multiplier / steps_since_improve / last_best_score 已在上方初始化或恢复
     let min_improve_steps = cfg.min_improve_steps();
     let reheat_decay = if min_improve_steps > 0 {
         (0.01f64).powf(1.0 / min_improve_steps as f64)
     } else {
         0.99
     };
-
-    let mut steps_since_improve = 0usize;
-    let mut last_best_score = best_score;
 
     let report_interval = (steps / 20).max(1);
     let perturb_interval = cfg.perturb_interval();
@@ -727,8 +966,37 @@ pub fn simulated_annealing(
 
     let sa_start = Instant::now();
 
-    // 主循环
-    for step in 0..steps {
+    // 主循环（从 start_step 开始，支持断点续算）
+    for step in start_step..steps {
+        // 检查外部停止信号（每 10000 步检查一次）
+        if step % 10000 == 0 && step > start_step && stop_flag.load(Ordering::Relaxed) {
+            if thread_id == 0 {
+                println!("\n   [T0] 收到停止信号，正在保存检查点...");
+            }
+            // 保存当前线程检查点
+            let ckpt = ThreadCheckpoint {
+                thread_id,
+                assignment: assignment.clone(),
+                best_assignment: best_assignment.clone(),
+                best_score,
+                best_metrics,
+                best_simple_metrics,
+                current_step: step,
+                temp_multiplier,
+                steps_since_improve,
+                last_best_score,
+            };
+            return SaResult {
+                assignment: best_assignment,
+                score: best_score,
+                metrics: best_metrics,
+                simple_metrics: best_simple_metrics,
+                checkpoint: Some(ckpt),
+                actual_temp_start,
+                actual_comfort_temp,
+            };
+        }
+
         let _progress = step as f64 / steps as f64;
         let base_temp = schedule.get(step, steps);
         let temp = base_temp * temp_multiplier;
@@ -764,6 +1032,12 @@ pub fn simulated_annealing(
             let allowed = &ctx.groups[r].allowed_keys;
             let new_k = allowed[rng.gen_range(0..allowed.len())];
             evaluator.try_move(ctx, &mut assignment, r, new_k, temp, &mut rng);
+        }
+
+        // 周期性刷新简码得分（每 10000 步一次，避免每步全量重建）
+        if ctx.enable_simple_code && step % 10000 == 0 {
+            evaluator.rebuild_simple(ctx, &assignment);
+            evaluator.score_dirty = true;
         }
 
         let current_score = evaluator.get_score(ctx);
@@ -901,5 +1175,13 @@ pub fn simulated_annealing(
         println!("   [T0] 最终得分: {:.4} 重码: {}", best_score, best_metrics.collision_count);
     }
 
-    (best_assignment, best_score, best_metrics, best_simple_metrics)
+    SaResult {
+        assignment: best_assignment,
+        score: best_score,
+        metrics: best_metrics,
+        simple_metrics: best_simple_metrics,
+        checkpoint: None,
+        actual_temp_start,
+        actual_comfort_temp,
+    }
 }

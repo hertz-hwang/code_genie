@@ -3,21 +3,39 @@
 // =========================================================================
 
 use std::collections::HashMap;
+use serde::{Serialize, Deserialize};
 
-/// 键位空间大小（a-z + _ + ; + , + . + /）
+/// 键位空间大小（a-z 中 _ 对应空格键的索引）
 pub const KEY_SPACE: usize = 26;
-/// 当量表大小
-pub const EQUIV_TABLE_SIZE: usize = 31;
+/// 当量表大小（全键盘 47 键）
+/// 索引分配：
+///   0-25:  a-z
+///   26:    _ (空格)
+///   27:    ;
+///   28:    ,
+///   29:    .
+///   30:    /
+///   31:    1
+///   32:    2
+///   33:    3
+///   34:    4
+///   35:    5
+///   36:    6
+///   37:    7
+///   38:    8
+///   39:    9
+///   40:    0
+///   41:    -
+///   42:    =
+///   43:    [
+///   44:    ]
+///   45:    \
+///   46:    '
+pub const EQUIV_TABLE_SIZE: usize = 47;
 /// 分组标记起始值
 pub const GROUP_MARKER: u16 = 1000;
 
 /// 将字符转换为键位索引
-/// - a-z: 0-25
-/// - _: 26
-/// - ;: 27
-/// - ,: 28
-/// - .: 29
-/// - /: 30
 pub fn char_to_key_index(c: char) -> Option<usize> {
     match c {
         'a'..='z' => Some((c as u8 - b'a') as usize),
@@ -26,6 +44,22 @@ pub fn char_to_key_index(c: char) -> Option<usize> {
         ',' => Some(28),
         '.' => Some(29),
         '/' => Some(30),
+        '1' => Some(31),
+        '2' => Some(32),
+        '3' => Some(33),
+        '4' => Some(34),
+        '5' => Some(35),
+        '6' => Some(36),
+        '7' => Some(37),
+        '8' => Some(38),
+        '9' => Some(39),
+        '0' => Some(40),
+        '-' => Some(41),
+        '=' => Some(42),
+        '[' => Some(43),
+        ']' => Some(44),
+        '\\' => Some(45),
+        '\'' => Some(46),
         _ => None,
     }
 }
@@ -39,6 +73,22 @@ pub fn key_to_char(key: u8) -> char {
         28 => ',',
         29 => '.',
         30 => '/',
+        31 => '1',
+        32 => '2',
+        33 => '3',
+        34 => '4',
+        35 => '5',
+        36 => '6',
+        37 => '7',
+        38 => '8',
+        39 => '9',
+        40 => '0',
+        41 => '-',
+        42 => '=',
+        43 => '[',
+        44 => ']',
+        45 => '\\',
+        46 => '\'',
         _ => '?',
     }
 }
@@ -94,7 +144,7 @@ impl Default for WeightConfig {
 }
 
 /// 缩放配置 - 用于将不同量纲的指标归一化
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct ScaleConfig {
     /// 重码数缩放因子
     pub collision_count: f64,
@@ -153,6 +203,34 @@ pub struct CharInfo {
     pub parts: Vec<u16>,
     /// 使用频率
     pub frequency: u64,
+    /// 当前编码值（用于增量更新）
+    #[allow(dead_code)]
+    pub current_code: usize,
+    /// 预计算的键位索引（分配时从 assignment 解析），用于快速增量更新
+    pub current_key_indices: Vec<u16>,
+}
+
+impl CharInfo {
+    /// 从 parts 和 assignment 计算当前 key_indices
+    #[allow(dead_code)]
+    pub fn update_key_indices(&mut self, ctx: &crate::context::OptContext, assignment: &[u8]) {
+        self.current_key_indices.clear();
+        for &p in &self.parts {
+            let k = ctx.resolve_key(p, assignment);
+            self.current_key_indices.push(k as u16);
+        }
+    }
+
+    /// 从 parts 和 assignment 计算当前 key_indices（使用缓冲区）
+    #[allow(dead_code)]
+    pub fn update_key_indices_with_buf(&mut self, ctx: &crate::context::OptContext, assignment: &[u8], buf: &mut Vec<u16>) {
+        buf.clear();
+        for &p in &self.parts {
+            let k = ctx.resolve_key(p, assignment);
+            buf.push(k as u16);
+        }
+        std::mem::swap(&mut self.current_key_indices, buf);
+    }
 }
 
 /// 字根组 - 用于需要优化的动态字根
@@ -165,7 +243,7 @@ pub struct RootGroup {
 }
 
 /// 评估指标
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Metrics {
     /// 重码数
     pub collision_count: usize,
@@ -180,7 +258,7 @@ pub struct Metrics {
 }
 
 /// 简码评估指标
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 pub struct SimpleMetrics {
     /// 频率覆盖率
     pub weighted_freq_coverage: f64,
