@@ -715,10 +715,13 @@ fn run_optimize(cfg: &Config, use_amhb: bool, use_keysoul: bool, cli_config_path
     }
 
     // 创建输出目录
-    let timestamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let timestamp = Local::now().format("%Y%m%d%-H%M%S").to_string();
     let output_dir = format!("output-{}", timestamp);
     std::fs::create_dir_all(&output_dir).expect("无法创建输出目录");
     println!("输出目录: {}", output_dir);
+    if let Err(e) = std::fs::copy(cli_config_path, format!("{}/config.toml", output_dir)) {
+        eprintln!("警告：无法复制配置文件: {}", e);
+    }
 
     // ==================== 加载数据 ====================
     let (fixed_roots, constrained) = loader::load_fixed(&cfg.files.fixed);
@@ -1262,6 +1265,9 @@ fn run_resume(cfg: &Config, checkpoint_path: &str) {
     let output_dir = format!("output-{}", timestamp);
     std::fs::create_dir_all(&output_dir).expect("无法创建输出目录");
     println!("  输出目录: {}", output_dir);
+    if let Err(e) = std::fs::copy(&ckpt.config_path, format!("{}/config.toml", output_dir)) {
+        eprintln!("警告：无法复制配置文件: {}", e);
+    }
 
     // 设置 Ctrl+C 信号处理
     let stop_flag = Arc::new(AtomicBool::new(false));
