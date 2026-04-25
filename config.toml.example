@@ -2,7 +2,10 @@
 # 🔧 CodeGenie 配置文件
 # =========================================================================
 # 使用方法：将本文件复制为 config.toml，按需修改后运行优化。
-# 运行命令：cargo run --release -- -c config.toml
+# 运行命令：
+#    cp config.toml.example config.toml
+#    cargo build --release
+#    ./target/release/code_genie optimize
 
 # -------------------------------------------------------------------------
 # 📂 文件路径配置
@@ -20,6 +23,7 @@ dynamic = "input-roots.txt"
 # 拆分表文件：每行格式为 "汉字\t字根1 字根2 ...\t频率"
 #   定义每个汉字由哪些字根组成，以及该汉字在语料中的使用频率
 splits = "input-division.txt"
+word_div = "input-worddiv.txt"   # 多字词拆分文件（启用词码优化时需要）
 
 # 字根对当量文件：每行格式为 "键对\t当量值"
 #   记录两个键连续击打的手指移动代价（当量越小越流畅）
@@ -31,6 +35,43 @@ pair_equiv = "pair_equivalence.txt"
 key_dist = "key_distribution.txt"
 
 # -------------------------------------------------------------------------
+# ⚖️ 权重配置
+# -------------------------------------------------------------------------
+# 顶层权重：三组目标的相对重要性（建议总和为 1.0）
+[weights]
+full = 0.4       # 单字全码权重
+simple = 0.5     # 单字简码权重
+word = 0.1       # 多字词全码权重（需同时启用 word_code.enabled）
+
+# 单字全码子权重（calibrate_scales 已将各指标归一化到初始值≈1.0，子权重直接表达各指标的相对重要性，无需归一化）
+[weights.full_code]
+top_n = 1500                  # 字频前 N 重码数的 N 值
+top_n_collision_count = 5.0   # 前 N 重码数权重
+collision_count = 10.0         # 总重码数权重
+collision_rate = 15.0          # 重码率权重
+equivalence = 10.0             # 当量权重
+distribution = 5.0            # 键位分布偏差权重
+
+# 单字简码子权重（同上，无需归一化）
+[weights.simple_code]
+enabled = true
+weighted_key_length = 20.0     # 加权码长权重（全字符加权平均码长）
+collision_count = 15.0         # 重码数权重
+collision_rate = 20.0          # 重码率权重
+equivalence = 30.0             # 当量权重
+distribution = 5.0            # 键位分布偏差权重
+
+# 多字词全码子权重（同上，无需归一化）
+[weights.word_code]
+enabled = true                  # 是否启用词码优化
+top2000_collision_count = 0.0   # 词频前 2000 重码数权重
+top10000_collision_count = 0.0  # 词频前 10000 重码数权重
+collision_count = 0.0           # 总重码数权重
+collision_rate = 100.0            # 重码率权重
+equivalence = 10.0               # 当量权重
+distribution = 0.0              # 键位分布偏差权重
+
+# -------------------------------------------------------------------------
 # 🎰 AMHB 算法参数（仅 --amhb 模式使用）
 # -------------------------------------------------------------------------
 # AMHB（Adaptive Multi-candidate Heat Bath）是模拟退火的替代算法。
@@ -39,18 +80,18 @@ key_dist = "key_distribution.txt"
 [amhb]
 # EXP3 算子池大小：同时维护的候选邻居解数量。
 #   值越大，每步探索范围越广，但内存和计算开销也越大。
-total_neighbors = 200
+total_neighbors = 240
 
 # 工作窃取阈值：当某线程的任务队列剩余量低于此值时，
 #   允许从其他线程"窃取"任务，提高多线程负载均衡效率。
-steal_threshold = 0
+steal_threshold = 1
 
 # 最大迭代步数：AMHB 算法的总运行步数上限，达到后强制停止。
 total_steps = 1000000000
 
 # AMHB 初始温度：Heat Bath 接受准则中的温度参数。
 #   温度越高，接受劣解的概率越大（探索性越强）；
-temp_start = 100.0
+temp_start = 40.0
 
 # 分段降温参数（piecewise exponential cooling）
 # 每段定义 threshold 和 factor：当 temp > threshold 时，每步 temp *= factor
@@ -72,9 +113,9 @@ threshold = 1.25
 factor = 0.9999995
 
 [[amhb.cooling_segments]]
-# 低温区（0.15 < temp ≤ 1.25）：极缓慢降温，收敛到局部最优
-#   当 temp ≤ 0.000001 时，所有段均不满足，算法终止
-threshold = 0.000001
+# 低温区（0.002 < temp ≤ 1.25）：极缓慢降温，收敛到局部最优
+#   当 temp ≤ 0.002 时，所有段均不满足，算法终止
+threshold = 0.002
 factor = 0.9999999625
 
 # -------------------------------------------------------------------------
@@ -93,7 +134,7 @@ total_steps = 2000000
 
 # 初始温度：SA 开始时的温度，决定初期接受劣解的概率。
 #   温度越高，初期探索范围越广；过高会导致随机游走，过低会过早收敛。
-temp_start = 100.0
+temp_start = 0              # 初始温度 (0=自动校准，推荐)
 
 # 结束温度：SA 终止的温度阈值，低于此值时停止。
 #   通常设为极小值，确保算法在 total_steps 内自然结束。
@@ -168,67 +209,6 @@ allowed = "qwertyuiopasdfghjklzxcvbnm"
 display_order = "qwertyuiopasdfghjklzxcvbnm"
 
 # -------------------------------------------------------------------------
-# ⚖️ 权重配置
-# -------------------------------------------------------------------------
-# 优化目标 = 全码目标 * full_code_weight + 简码目标 * simple_code_weight
-# 全码目标 = Σ(各指标值 * 对应权重)，权重总和建议为 1.0
-
-[weights.full_code]
-# 全码重码数权重：重码数越少越好。
-#   重码数 = 编码相同的汉字对数，直接影响输入时需要翻页选字的频率。
-#   这是最核心的优化目标，通常给予最高权重。
-collision_count = 1.0
-
-# 全码重码率权重：重码率 = 重码字的加权频率占比。
-#   与重码数互补：重码率更关注高频字的重码情况。
-#   设为 0 时只优化重码数，不区分高频低频重码。
-collision_rate = 0.0
-
-# 当量权重：所有汉字编码的平均击键当量（手指移动代价）。
-#   当量越小，输入越流畅；需要 pair_equivalence.txt 或 --keysoul 提供当量数据。
-equivalence = 0.0
-
-# 当量变异系数权重：当量的标准差/均值，衡量当量分布的均匀程度。
-#   CV 越小，各汉字的输入流畅度越一致，避免部分字极难输入。
-equiv_cv = 0.0
-
-# 分布偏差权重：实际键位使用率与 key_distribution.txt 中目标分布的偏差。
-#   偏差越小，手指负载越均衡，长期使用不易疲劳。
-distribution = 0.0
-
-[weights.simple_code]
-# 是否启用简码优化：true 时同时优化全码和简码目标。
-#   简码（一级简码、二级简码等）让高频字可以用更少按键输入。
-#   启用后优化时间会增加，但能显著提升高频字的输入效率。
-enabled = false
-
-# 全码目标总权重：在联合优化中，全码目标占总目标的比重。
-#   full_code_weight + simple_code_weight 建议等于 1.0。
-full_code_weight = 1.0
-
-# 简码目标总权重：简码目标在总目标中的比重。
-#   值越大，优化器越倾向于改善简码质量，可能以牺牲部分全码质量为代价。
-simple_code_weight = 0.0
-
-# 简码内部子权重（总和建议为 1.0，仅 enabled=true 时生效）
-
-# 简码重码数权重：简码中编码相同的汉字对数。
-collision_count = 0.0
-
-# 简码重码率权重：简码重码的加权频率占比。
-collision_rate = 0.0
-
-# 频率覆盖权重：被分配到简码的汉字频率总和占比。
-#   覆盖率越高，越多的高频字能享受简码加速。
-freq = 0.0
-
-# 简码当量权重：简码编码的平均击键当量。
-equiv = 0.0
-
-# 简码分布偏差权重：简码键位使用率与目标分布的偏差。
-dist = 0.0
-
-# -------------------------------------------------------------------------
 # 📝 简码规则配置
 # -------------------------------------------------------------------------
 # 取码规则说明:
@@ -252,6 +232,7 @@ dist = 0.0
 level = 1
 code_num = 0
 rules = ["Aa"]
+allowed_orig_length = 0  # 0 = 不限制；设为正整数则只允许该码长的全码出简码
 
 # 二级简码：用 2 个键表示一个汉字
 #   rules=["AaBa"] 表示取第1根第1码 + 第2根第1码
@@ -259,12 +240,14 @@ rules = ["Aa"]
 level = 2
 code_num = 0
 rules = ["AaBa"]
+allowed_orig_length = 0
 
 # 三级简码：用 3 个键表示一个汉字
 #   rules 支持多个候选规则，系统依次尝试，选择第一个能成功解析的规则
-#   "AaAbZz" = 第1根第1码 + 第1根第2码 + 最后一根最后一码（适合多码根方案）
-#   "AaBaZz" = 第1根第1码 + 第2根第1码 + 最后一根最后一码（适合单码根方案）
+#   "AaAbZz" = 第1根第1码 + 第1根第2码 + 最后一根最后一码
+#   "AaBaZz" = 第1根第1码 + 第2根第1码 + 最后一根最后一码
 [[simple_levels]]
 level = 3
 code_num = 0
 rules = ["AaAbZz", "AaBaZz"]
+allowed_orig_length = 0

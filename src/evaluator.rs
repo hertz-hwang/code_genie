@@ -6,7 +6,7 @@ use rand::prelude::*;
 use std::collections::HashMap;
 
 use crate::context::OptContext;
-use crate::types::{KeyDistConfig, Metrics, SimpleMetrics, EQUIV_TABLE_SIZE, GROUP_MARKER};
+use crate::types::{KeyDistConfig, Metrics, SimpleMetrics, WordMetrics, EQUIV_TABLE_SIZE};
 
 // =========================================================================
 // 简码评估器
@@ -14,39 +14,27 @@ use crate::types::{KeyDistConfig, Metrics, SimpleMetrics, EQUIV_TABLE_SIZE, GROU
 
 /// 简码级别跟踪器
 struct SimpleLevelTracker {
-    /// 该级别的编码数
     code_num: usize,
-    /// 编码到候选汉字的映射 (编码 -> [(汉字索引, 频率)])
+    allowed_orig_length: usize,
     code_to_candidates: HashMap<usize, Vec<(usize, u64)>>,
-    /// 已覆盖的频率
     covered_freq: u64,
-    /// 加权等价值
     equiv_weighted: f64,
-    /// 等价值频率总和
     equiv_freq_sum: u64,
-    /// 键位使用统计
     key_usage: [f64; EQUIV_TABLE_SIZE],
-    /// 键击次数
     key_presses: f64,
-    /// 已分配的汉字列表
     assigned_chars: Vec<usize>,
+    /// Σ(freq_i * (simple_len_i - full_len_i)) for assigned chars at this level
+    wkl_delta: f64,
 }
 
 /// 简码评估器
 pub struct SimpleEvaluator {
-    /// 各简码级别的跟踪器
     levels: Vec<SimpleLevelTracker>,
-    /// 所有出简的汉字标记（跨级别），Vec<bool> 替代 HashSet 加速查找
     all_assigned_flags: Vec<bool>,
-    /// 简码重码数：全码桶去掉出简字后仍有重码的数量
     simple_collision_count: usize,
-    /// 简码重码率：全码桶去掉出简字后仍被重码的字频 / 总频
     simple_collision_rate: f64,
-    /// 缓存的简码得分
     cached_simple_score: f64,
-    /// 得分是否需要重新计算
     simple_score_dirty: bool,
-    /// 按频率降序排列的汉字索引（缓存，频率不变所以排序不变）
     sorted_chars: Vec<usize>,
 }
 
@@ -66,6 +54,7 @@ impl SimpleEvaluator {
             .iter()
             .map(|l| SimpleLevelTracker {
                 code_num: l.code_num,
+                allowed_orig_length: l.allowed_orig_length,
                 code_to_candidates: HashMap::new(),
                 covered_freq: 0,
                 equiv_weighted: 0.0,
@@ -73,6 +62,7 @@ impl SimpleEvaluator {
                 key_usage: [0.0; EQUIV_TABLE_SIZE],
                 key_presses: 0.0,
                 assigned_chars: Vec::new(),
+                wkl_delta: 0.0,
             })
             .collect();
 
@@ -156,9 +146,15 @@ impl SimpleEvaluator {
         level.key_usage = [0.0; EQUIV_TABLE_SIZE];
         level.key_presses = 0.0;
         level.assigned_chars.clear();
+        level.wkl_delta = 0.0;
 
         for &ci in sorted_chars {
             if excluded[ci] {
+                continue;
+            }
+            if level.allowed_orig_length != 0
+                && ctx.char_infos[ci].parts_len as usize != level.allowed_orig_length
+            {
                 continue;
             }
             if let Some(code) = ctx.calc_simple_code(ci, li, assignment) {
@@ -200,10 +196,13 @@ impl SimpleEvaluator {
 
             if let Some(keys) = ctx.get_simple_keys(ci, li, assignment) {
                 let freq_f = freq as f64;
+                let simple_len = keys.len() as f64;
+                let full_len = ctx.char_infos[ci].parts_len as f64;
+                level.wkl_delta += freq_f * (simple_len - full_len);
                 for &k in &keys {
                     level.key_usage[k as usize] += freq_f;
                 }
-                level.key_presses += freq_f * keys.len() as f64;
+                level.key_presses += freq_f * simple_len;
             }
         }
     }
@@ -293,18 +292,17 @@ impl SimpleEvaluator {
     fn compute_simple_score(&self, ctx: &OptContext) -> f64 {
         let sm = self.get_simple_metrics(ctx);
 
-        let freq_loss = (1.0 - sm.weighted_freq_coverage) * ctx.scale_config.simple_freq;
-        let equiv_loss = sm.equiv_mean * ctx.scale_config.simple_equiv;
-        let dist_loss = sm.dist_deviation * ctx.scale_config.simple_dist;
-        let collision_count_loss =
-            sm.collision_count as f64 * ctx.scale_config.simple_collision_count;
+        let wkl_loss = sm.weighted_key_length * ctx.scale_config.simple_weighted_key_length;
+        let equiv_loss = sm.equiv_mean * ctx.scale_config.simple_equivalence;
+        let dist_loss = sm.dist_deviation * ctx.scale_config.simple_distribution;
+        let collision_count_loss = sm.collision_count as f64 * ctx.scale_config.simple_collision_count;
         let collision_rate_loss = sm.collision_rate * ctx.scale_config.simple_collision_rate;
 
-        ctx.weights.simple_weight_freq * freq_loss
-            + ctx.weights.simple_weight_equiv * equiv_loss
-            + ctx.weights.simple_weight_dist * dist_loss
-            + ctx.weights.simple_weight_collision_count * collision_count_loss
-            + ctx.weights.simple_weight_collision_rate * collision_rate_loss
+        ctx.weights.simple_weighted_key_length * wkl_loss
+            + ctx.weights.simple_equivalence * equiv_loss
+            + ctx.weights.simple_distribution * dist_loss
+            + ctx.weights.simple_collision_count * collision_count_loss
+            + ctx.weights.simple_collision_rate * collision_rate_loss
     }
 
     /// 获取简码得分
@@ -319,24 +317,25 @@ impl SimpleEvaluator {
 
     /// 获取简码评估指标
     pub fn get_simple_metrics(&self, ctx: &OptContext) -> SimpleMetrics {
-        let mut total_covered = 0u64;
         let mut total_equiv_weighted = 0.0f64;
         let mut total_equiv_freq = 0u64;
         let mut total_key_usage = [0.0f64; EQUIV_TABLE_SIZE];
         let mut total_key_presses = 0.0f64;
+        let mut total_wkl_delta = 0.0f64;
 
         for level in &self.levels {
-            total_covered += level.covered_freq;
             total_equiv_weighted += level.equiv_weighted;
             total_equiv_freq += level.equiv_freq_sum;
             for k in 0..EQUIV_TABLE_SIZE {
                 total_key_usage[k] += level.key_usage[k];
             }
             total_key_presses += level.key_presses;
+            total_wkl_delta += level.wkl_delta;
         }
 
-        let coverage = if ctx.total_frequency > 0 {
-            total_covered as f64 / ctx.total_frequency as f64
+        // 加权码长 = (base_wkl + delta) / total_frequency
+        let weighted_key_length = if ctx.total_frequency > 0 {
+            (ctx.base_wkl + total_wkl_delta) / ctx.total_frequency as f64
         } else {
             0.0
         };
@@ -369,7 +368,7 @@ impl SimpleEvaluator {
         };
 
         SimpleMetrics {
-            weighted_freq_coverage: coverage,
+            weighted_key_length,
             equiv_mean,
             dist_deviation,
             collision_count: self.simple_collision_count,
@@ -379,62 +378,335 @@ impl SimpleEvaluator {
 }
 
 // =========================================================================
+// 词码评估器
+// =========================================================================
+
+/// 词码评估器 - 增量维护多字词全码的碰撞/当量/分布指标
+pub struct WordEvaluator {
+    current_codes: Vec<usize>,
+    current_equiv_val: Vec<f64>,
+    code_to_words: Vec<Vec<usize>>,
+    word_bucket_pos: Vec<usize>,
+    bucket_freq_sum: Vec<u64>,
+    bucket_max_freq: Vec<u64>,
+    populated_codes: Vec<usize>,
+    code_populated_pos: Vec<usize>,
+    total_collisions: usize,
+    collision_frequency: u64,
+    top2000_collisions: usize,
+    top10000_collisions: usize,
+    total_equiv_weighted: f64,
+    pub key_weighted_usage: [f64; EQUIV_TABLE_SIZE],
+    total_key_presses: f64,
+    total_frequency: u64,
+    inv_total_frequency: f64,
+}
+
+impl WordEvaluator {
+    pub fn new(ctx: &OptContext, assignment: &[u8]) -> Self {
+        let nw = ctx.word_infos.len();
+        let cs = ctx.code_space;
+        let mut code_to_words: Vec<Vec<usize>> = vec![Vec::new(); cs];
+        let mut word_bucket_pos = vec![0usize; nw];
+        let mut bucket_freq_sum = vec![0u64; cs];
+        let mut bucket_max_freq = vec![0u64; cs];
+        let mut current_codes = Vec::with_capacity(nw);
+        let mut current_equiv_val = Vec::with_capacity(nw);
+        let mut total_equiv_weighted = 0.0f64;
+        let mut key_weighted_usage = [0.0f64; EQUIV_TABLE_SIZE];
+        let mut total_key_presses = 0.0f64;
+
+        for wi in 0..nw {
+            let winfo = &ctx.word_infos[wi];
+            let freq_f = winfo.frequency as f64;
+            let code = ctx.calc_word_code(wi, assignment);
+            let equiv = ctx.calc_word_equiv(wi, assignment);
+            current_codes.push(code);
+            current_equiv_val.push(equiv);
+            let pos = code_to_words[code].len();
+            code_to_words[code].push(wi);
+            word_bucket_pos[wi] = pos;
+            bucket_freq_sum[code] += winfo.frequency;
+            if winfo.frequency > bucket_max_freq[code] {
+                bucket_max_freq[code] = winfo.frequency;
+            }
+            total_equiv_weighted += equiv * freq_f;
+            for &p in winfo.parts_slice() {
+                let k = ctx.resolve_key(p, assignment) as usize;
+                key_weighted_usage[k] += freq_f;
+            }
+            total_key_presses += freq_f * winfo.parts_len as f64;
+        }
+
+        let mut populated_codes = Vec::with_capacity(nw);
+        let mut code_populated_pos = vec![usize::MAX; cs];
+        let mut total_collisions = 0usize;
+        let mut collision_frequency = 0u64;
+        let mut top2000_collisions = 0usize;
+        let mut top10000_collisions = 0usize;
+
+        for code in 0..cs {
+            let words = &code_to_words[code];
+            if !words.is_empty() {
+                code_populated_pos[code] = populated_codes.len();
+                populated_codes.push(code);
+            }
+            if words.len() >= 2 {
+                total_collisions += words.len() - 1;
+                collision_frequency += bucket_freq_sum[code] - bucket_max_freq[code];
+                for &wi in words {
+                    if ctx.word_infos[wi].is_top2000 { top2000_collisions += 1; }
+                    if ctx.word_infos[wi].is_top10000 { top10000_collisions += 1; }
+                }
+            }
+        }
+
+        let inv_tf = if ctx.word_total_frequency > 0 {
+            1.0 / ctx.word_total_frequency as f64
+        } else {
+            0.0
+        };
+
+        Self {
+            current_codes,
+            current_equiv_val,
+            code_to_words,
+            word_bucket_pos,
+            bucket_freq_sum,
+            bucket_max_freq,
+            populated_codes,
+            code_populated_pos,
+            total_collisions,
+            collision_frequency,
+            top2000_collisions,
+            top10000_collisions,
+            total_equiv_weighted,
+            key_weighted_usage,
+            total_key_presses,
+            total_frequency: ctx.word_total_frequency,
+            inv_total_frequency: inv_tf,
+        }
+    }
+
+    /// 增量更新词 wi 从 old_code 移到 new_code
+    #[inline]
+    pub fn update_word(&mut self, ctx: &OptContext, wi: usize, old_code: usize, new_code: usize) {
+        let winfo = &ctx.word_infos[wi];
+        let freq = winfo.frequency;
+        let freq_f = freq as f64;
+        let _ = freq_f; // used in key_usage updates elsewhere
+
+        // ── 从旧桶移除 ──
+        let old_size = self.code_to_words[old_code].len();
+        let old_bucket_cc = old_size.saturating_sub(1);
+
+        // top-N 碰撞：旧桶 size >= 2 时 wi 在碰撞中
+        if old_size >= 2 {
+            if winfo.is_top2000 { self.top2000_collisions -= 1; }
+            if winfo.is_top10000 { self.top10000_collisions -= 1; }
+        }
+        // 旧桶 size == 2 时，另一个词也失去碰撞状态
+        if old_size == 2 {
+            let pos = self.word_bucket_pos[wi];
+            let other_wi = self.code_to_words[old_code][1 - pos];
+            let other = &ctx.word_infos[other_wi];
+            if other.is_top2000 { self.top2000_collisions -= 1; }
+            if other.is_top10000 { self.top10000_collisions -= 1; }
+        }
+
+        // swap_remove
+        let pos = self.word_bucket_pos[wi];
+        let last_idx = old_size - 1;
+        if pos != last_idx {
+            let moved_wi = self.code_to_words[old_code][last_idx];
+            self.code_to_words[old_code][pos] = moved_wi;
+            self.word_bucket_pos[moved_wi] = pos;
+        }
+        self.code_to_words[old_code].pop();
+
+        if self.code_to_words[old_code].is_empty() {
+            let pop_pos = self.code_populated_pos[old_code];
+            let last_pop = self.populated_codes.len() - 1;
+            if pop_pos != last_pop {
+                let moved_code = self.populated_codes[last_pop];
+                self.populated_codes[pop_pos] = moved_code;
+                self.code_populated_pos[moved_code] = pop_pos;
+            }
+            self.populated_codes.pop();
+            self.code_populated_pos[old_code] = usize::MAX;
+        }
+
+        // 碰撞频率
+        let old_bucket_cf = if old_size >= 2 {
+            self.bucket_freq_sum[old_code] - self.bucket_max_freq[old_code]
+        } else { 0 };
+        self.bucket_freq_sum[old_code] -= freq;
+        if freq >= self.bucket_max_freq[old_code] {
+            self.bucket_max_freq[old_code] = if self.code_to_words[old_code].is_empty() {
+                0
+            } else {
+                let mut max_f = 0u64;
+                for &wi2 in &self.code_to_words[old_code] {
+                    let f = ctx.word_infos[wi2].frequency;
+                    if f > max_f { max_f = f; }
+                }
+                max_f
+            };
+        }
+        let new_old_size = self.code_to_words[old_code].len();
+        let new_old_cf = if new_old_size >= 2 {
+            self.bucket_freq_sum[old_code] - self.bucket_max_freq[old_code]
+        } else { 0 };
+        let new_old_cc = new_old_size.saturating_sub(1);
+
+        // ── 插入新桶 ──
+        let new_size = self.code_to_words[new_code].len();
+        let new_bucket_cc = new_size.saturating_sub(1);
+
+        // top-N 碰撞：新桶 size >= 1 时 wi 将在碰撞中
+        if new_size >= 1 {
+            if winfo.is_top2000 { self.top2000_collisions += 1; }
+            if winfo.is_top10000 { self.top10000_collisions += 1; }
+        }
+        // 新桶 size == 1 时，已有词获得碰撞状态
+        if new_size == 1 {
+            let existing_wi = self.code_to_words[new_code][0];
+            let existing = &ctx.word_infos[existing_wi];
+            if existing.is_top2000 { self.top2000_collisions += 1; }
+            if existing.is_top10000 { self.top10000_collisions += 1; }
+        }
+
+        if new_size == 0 {
+            self.code_populated_pos[new_code] = self.populated_codes.len();
+            self.populated_codes.push(new_code);
+        }
+        let new_pos = new_size;
+        self.code_to_words[new_code].push(wi);
+        self.word_bucket_pos[wi] = new_pos;
+
+        let new_bucket_cf = if new_size >= 2 {
+            self.bucket_freq_sum[new_code] - self.bucket_max_freq[new_code]
+        } else { 0 };
+        self.bucket_freq_sum[new_code] += freq;
+        if freq > self.bucket_max_freq[new_code] {
+            self.bucket_max_freq[new_code] = freq;
+        }
+        let after_new_size = new_size + 1;
+        let after_new_cf = if after_new_size >= 2 {
+            self.bucket_freq_sum[new_code] - self.bucket_max_freq[new_code]
+        } else { 0 };
+        let after_new_cc = after_new_size.saturating_sub(1);
+
+        self.collision_frequency = (self.collision_frequency + new_old_cf + after_new_cf)
+            .wrapping_sub(old_bucket_cf + new_bucket_cf);
+        self.total_collisions = (self.total_collisions + new_old_cc + after_new_cc)
+            .wrapping_sub(old_bucket_cc + new_bucket_cc);
+
+        self.current_codes[wi] = new_code;
+    }
+
+    /// 更新词 wi 的当量（在 assignment 改变后调用）
+    #[inline]
+    pub fn update_word_equiv(&mut self, ctx: &OptContext, wi: usize, assignment: &[u8]) {
+        let freq_f = ctx.word_infos[wi].frequency as f64;
+        let old_eq = self.current_equiv_val[wi];
+        let new_eq = ctx.calc_word_equiv(wi, assignment);
+        self.total_equiv_weighted += (new_eq - old_eq) * freq_f;
+        self.current_equiv_val[wi] = new_eq;
+    }
+
+    /// 更新词 wi 的键位使用统计（在 assignment 改变后调用）
+    #[allow(dead_code)]
+    #[inline]
+    pub fn update_word_key_usage(&mut self, ctx: &OptContext, wi: usize, old_key: u8, new_key: u8) {
+        let winfo = &ctx.word_infos[wi];
+        let freq_f = winfo.frequency as f64;
+        // 统计该词中 old_key 出现次数
+        let mut count = 0usize;
+        for &p in winfo.parts_slice() {
+            if p < 1000 && p as u8 == old_key {
+                count += 1;
+            }
+        }
+        if count > 0 {
+            let delta = freq_f * count as f64;
+            self.key_weighted_usage[old_key as usize] -= delta;
+            self.key_weighted_usage[new_key as usize] += delta;
+        }
+    }
+
+    /// 计算词码得分
+    pub fn compute_word_score(&self, ctx: &OptContext) -> f64 {
+        let wm = self.get_word_metrics(ctx);
+        ctx.weights.word_top2000_collision * wm.top2000_collision_count as f64 * ctx.scale_config.word_top2000_collision
+            + ctx.weights.word_top10000_collision * wm.top10000_collision_count as f64 * ctx.scale_config.word_top10000_collision
+            + ctx.weights.word_collision_count * wm.collision_count as f64 * ctx.scale_config.word_collision_count
+            + ctx.weights.word_collision_rate * wm.collision_rate * ctx.scale_config.word_collision_rate
+            + ctx.weights.word_equivalence * wm.equiv_mean * ctx.scale_config.word_equivalence
+            + ctx.weights.word_distribution * wm.dist_deviation * ctx.scale_config.word_distribution
+    }
+
+    /// 获取词码评估指标
+    pub fn get_word_metrics(&self, ctx: &OptContext) -> WordMetrics {
+        let collision_rate = self.collision_frequency as f64 * self.inv_total_frequency;
+        let equiv_mean = self.total_equiv_weighted * self.inv_total_frequency;
+        let dist_deviation = self.calc_distribution_deviation(&ctx.key_dist_config);
+        WordMetrics {
+            top2000_collision_count: self.top2000_collisions,
+            top10000_collision_count: self.top10000_collisions,
+            collision_count: self.total_collisions,
+            collision_rate,
+            equiv_mean,
+            dist_deviation,
+        }
+    }
+
+    fn calc_distribution_deviation(&self, key_dist_config: &[KeyDistConfig; EQUIV_TABLE_SIZE]) -> f64 {
+        if self.total_key_presses == 0.0 { return 0.0; }
+        let inv = 1.0 / self.total_key_presses;
+        let mut dev = 0.0;
+        for key in 0..EQUIV_TABLE_SIZE {
+            let cfg = &key_dist_config[key];
+            if cfg.target_rate == 0.0 && cfg.low_penalty == 0.0 && cfg.high_penalty == 0.0 { continue; }
+            let actual_pct = self.key_weighted_usage[key] * 100.0 * inv;
+            let diff = actual_pct - cfg.target_rate;
+            if diff < 0.0 { dev += diff * diff * cfg.low_penalty; }
+            else if diff > 0.0 { dev += diff * diff * cfg.high_penalty; }
+        }
+        dev
+    }
+}
+
+// =========================================================================
 // 主评估器
 // =========================================================================
 
 /// 主评估器 - 评估整个编码方案
 pub struct Evaluator {
-    /// 当前编码列表
     current_codes: Vec<usize>,
-    /// 当前等价值列表
     current_equiv_val: Vec<f64>,
-    /// 编码到汉字的映射（直接索引，大小 = code_space）
     code_to_chars: Vec<Vec<usize>>,
-    /// 每个汉字在其桶中的位置（用于 O(1) swap_remove）
     char_bucket_pos: Vec<usize>,
-    /// 每个桶的频率总和
     bucket_freq_sum: Vec<u64>,
-    /// 每个桶的最大频率（用于增量 collision_freq 计算）
     bucket_max_freq: Vec<u64>,
-
-    /// 非空桶索引列表（用于快速遍历，替代全量扫描 code_space）
     populated_codes: Vec<usize>,
-    /// 每个 code 在 populated_codes 中的位置（usize::MAX 表示不在列表中）
     code_populated_pos: Vec<usize>,
-
-    /// 总重码数
     total_collisions: usize,
-    /// 重码频率
     collision_frequency: u64,
-
-    /// 加权等价值总和
+    /// 字频前 N 重码数（N 由 ctx.weights.full_top_n 决定）
+    top_n_collisions: usize,
     total_equiv_weighted: f64,
-    /// 加权等价值平方总和
-    total_equiv_sq_weighted: f64,
-
-    /// 键位加权使用统计
     pub key_weighted_usage: [f64; EQUIV_TABLE_SIZE],
-    /// 总键击次数
     #[allow(dead_code)]
     pub total_key_presses: f64,
-
-    /// 总频率
     #[allow(dead_code)]
     pub total_frequency: u64,
-    /// 总频率倒数
     pub inv_total_frequency: f64,
-    /// 总键击次数倒数
     pub inv_total_key_presses: f64,
-
-    /// 缓存的得分
     pub cached_score: f64,
-    /// 得分是否需要重新计算
     pub score_dirty: bool,
-
-    /// 简码评估器
     simple_eval: Option<SimpleEvaluator>,
-
-    /// 轻量桶计数器（仅在不需要桶成员列表时使用）
+    word_eval: Option<WordEvaluator>,
     bucket_count: Vec<u32>,
 }
 
@@ -451,33 +723,16 @@ impl Evaluator {
         let mut current_equiv_val = Vec::with_capacity(n);
 
         let mut total_equiv_weighted = 0.0f64;
-        let mut total_equiv_sq_weighted = 0.0f64;
         let mut key_weighted_usage = [0.0f64; EQUIV_TABLE_SIZE];
         let mut total_key_presses = 0.0f64;
 
         for ci in 0..n {
             let info = &ctx.char_infos[ci];
             let freq_f = info.frequency as f64;
-
-            // 使用快速版本计算 code 和 equiv
             let code = ctx.calc_code_only(ci, assignment);
             let equiv = ctx.calc_equiv_from_parts(ci, assignment);
-
             current_codes.push(code);
             current_equiv_val.push(equiv);
-
-            // 更新 CharInfo 中的 current_key_indices（用于后续快速更新）
-            // 注意：这里重新计算是为了确保一致性
-            let mut key_indices = info.parts.clone();
-            for p in &mut key_indices {
-                if *p >= GROUP_MARKER {
-                    let gi = (*p - GROUP_MARKER) as usize;
-                    *p = assignment[gi] as u16;
-                }
-            }
-            // 存储到新的 Vec（CharInfo 不直接暴露 current_key_indices 的可变访问）
-            // 我们将在 update_char 中使用 ctx 计算
-
             let pos = code_to_chars[code].len();
             code_to_chars[code].push(ci);
             char_bucket_pos[ci] = pos;
@@ -485,22 +740,19 @@ impl Evaluator {
             if info.frequency > bucket_max_freq[code] {
                 bucket_max_freq[code] = info.frequency;
             }
-
             total_equiv_weighted += equiv * freq_f;
-            total_equiv_sq_weighted += equiv * equiv * freq_f;
-
-            for &p in &info.parts {
+            for &p in info.parts_slice() {
                 let k = ctx.resolve_key(p, assignment) as usize;
                 key_weighted_usage[k] += freq_f;
             }
-            total_key_presses += freq_f * info.parts.len() as f64;
+            total_key_presses += freq_f * info.parts_len as f64;
         }
 
-        // 构建 populated_codes 索引（只记录非空桶）
-        let mut populated_codes = Vec::with_capacity(n); // 最多 n 个不同编码
+        let mut populated_codes = Vec::with_capacity(n);
         let mut code_populated_pos = vec![usize::MAX; cs];
         let mut total_collisions = 0usize;
         let mut collision_frequency = 0u64;
+        let mut top_n_collisions = 0usize;
         for code in 0..cs {
             if !code_to_chars[code].is_empty() {
                 code_populated_pos[code] = populated_codes.len();
@@ -510,19 +762,14 @@ impl Evaluator {
             if cnt >= 2 {
                 total_collisions += cnt - 1;
                 collision_frequency += bucket_freq_sum[code] - bucket_max_freq[code];
+                for &ci in &code_to_chars[code] {
+                    if ctx.top_n_char_flags[ci] { top_n_collisions += 1; }
+                }
             }
         }
 
-        let inv_tf = if ctx.total_frequency > 0 {
-            1.0 / ctx.total_frequency as f64
-        } else {
-            0.0
-        };
-        let inv_tkp = if total_key_presses > 0.0 {
-            1.0 / total_key_presses
-        } else {
-            0.0
-        };
+        let inv_tf = if ctx.total_frequency > 0 { 1.0 / ctx.total_frequency as f64 } else { 0.0 };
+        let inv_tkp = if total_key_presses > 0.0 { 1.0 / total_key_presses } else { 0.0 };
 
         let simple_eval = if ctx.enable_simple_code && !ctx.simple_config.levels.is_empty() {
             Some(SimpleEvaluator::new(ctx, assignment, &populated_codes, &code_to_chars))
@@ -530,7 +777,12 @@ impl Evaluator {
             None
         };
 
-        // 构建轻量桶计数器（用于不需要桶成员列表时的快速路径）
+        let word_eval = if ctx.enable_word_code && !ctx.word_infos.is_empty() {
+            Some(WordEvaluator::new(ctx, assignment))
+        } else {
+            None
+        };
+
         let mut bucket_count = vec![0u32; cs];
         for code in 0..cs {
             bucket_count[code] = code_to_chars[code].len() as u32;
@@ -547,8 +799,8 @@ impl Evaluator {
             code_populated_pos,
             total_collisions,
             collision_frequency,
+            top_n_collisions,
             total_equiv_weighted,
-            total_equiv_sq_weighted,
             key_weighted_usage,
             total_key_presses,
             total_frequency: ctx.total_frequency,
@@ -557,6 +809,7 @@ impl Evaluator {
             cached_score: 0.0,
             score_dirty: true,
             simple_eval,
+            word_eval,
             bucket_count,
         };
         e.cached_score = e.compute_score(ctx);
@@ -613,7 +866,6 @@ impl Evaluator {
             let old_eq = self.current_equiv_val[ci];
             let new_eq = ctx.calc_equiv_from_parts(ci, assignment);
             self.total_equiv_weighted += (new_eq - old_eq) * freq_f;
-            self.total_equiv_sq_weighted += (new_eq * new_eq - old_eq * old_eq) * freq_f;
             self.current_equiv_val[ci] = new_eq;
         }
 
@@ -622,7 +874,18 @@ impl Evaluator {
             let old_len = self.code_to_chars[old_code].len();
             let old_bucket_cc = old_len.saturating_sub(1);
 
-            // swap_remove: 用最后一个元素替换被移除的元素
+            // top-N 碰撞：旧桶 size >= 2 时 ci 在碰撞中
+            if old_len >= 2 && ctx.top_n_char_flags[ci] {
+                self.top_n_collisions -= 1;
+            }
+            // 旧桶 size == 2 时，另一个字也失去碰撞状态
+            if old_len == 2 {
+                let pos = self.char_bucket_pos[ci];
+                let other_ci = self.code_to_chars[old_code][1 - pos];
+                if ctx.top_n_char_flags[other_ci] { self.top_n_collisions -= 1; }
+            }
+
+            // swap_remove
             let pos = self.char_bucket_pos[ci];
             let last_idx = old_len - 1;
             if pos != last_idx {
@@ -679,6 +942,16 @@ impl Evaluator {
             // === 插入新桶 ===
             let new_len = self.code_to_chars[new_code].len();
             let new_bucket_cc = new_len.saturating_sub(1);
+
+            // top-N 碰撞：新桶 size >= 1 时 ci 将在碰撞中
+            if new_len >= 1 && ctx.top_n_char_flags[ci] {
+                self.top_n_collisions += 1;
+            }
+            // 新桶 size == 1 时，已有字获得碰撞状态
+            if new_len == 1 {
+                let existing_ci = self.code_to_chars[new_code][0];
+                if ctx.top_n_char_flags[existing_ci] { self.top_n_collisions += 1; }
+            }
 
             // 新桶从空变非空时，加入 populated_codes
             if new_len == 0 {
@@ -741,36 +1014,27 @@ impl Evaluator {
     /// 计算全码得分
     #[inline(always)]
     pub fn compute_full_score(&self, ctx: &OptContext) -> f64 {
-        let mut score = ctx.weights.weight_collision_count
+        let mut score = ctx.weights.full_top_n_collision
+            * self.top_n_collisions as f64
+            * ctx.scale_config.full_top_n_collision;
+
+        score += ctx.weights.full_collision_count
             * self.total_collisions as f64
-            * ctx.scale_config.collision_count;
+            * ctx.scale_config.full_collision_count;
 
-        if ctx.weights.weight_collision_rate > 0.0 {
+        if ctx.weights.full_collision_rate > 0.0 {
             let collision_rate = self.collision_frequency as f64 * self.inv_total_frequency;
-            score += ctx.weights.weight_collision_rate
-                * collision_rate
-                * ctx.scale_config.collision_rate;
+            score += ctx.weights.full_collision_rate * collision_rate * ctx.scale_config.full_collision_rate;
         }
 
-        if ctx.weights.weight_equivalence > 0.0 {
+        if ctx.weights.full_equivalence > 0.0 {
             let weighted_equiv = self.total_equiv_weighted * self.inv_total_frequency;
-            score += ctx.weights.weight_equivalence
-                * weighted_equiv
-                * ctx.scale_config.equivalence;
+            score += ctx.weights.full_equivalence * weighted_equiv * ctx.scale_config.full_equivalence;
         }
 
-        if ctx.weights.weight_equiv_cv > 0.0 {
-            let equiv_cv = self.calc_equiv_cv();
-            score += ctx.weights.weight_equiv_cv
-                * equiv_cv
-                * ctx.scale_config.equiv_cv;
-        }
-
-        if ctx.weights.weight_distribution > 0.0 {
+        if ctx.weights.full_distribution > 0.0 {
             let dist_deviation = self.calc_distribution_deviation(&ctx.key_dist_config);
-            score += ctx.weights.weight_distribution
-                * dist_deviation
-                * ctx.scale_config.distribution;
+            score += ctx.weights.full_distribution * dist_deviation * ctx.scale_config.full_distribution;
         }
 
         score
@@ -781,16 +1045,21 @@ impl Evaluator {
     pub fn compute_score(&self, ctx: &OptContext) -> f64 {
         let full_score = self.compute_full_score(ctx);
 
-        if ctx.enable_simple_code {
-            if let Some(ref se) = self.simple_eval {
-                let simple_score = se.cached_simple_score;
-                ctx.weights.weight_full_code * full_score + ctx.weights.weight_simple_code * simple_score
-            } else {
-                full_score
-            }
+        let simple_score = if ctx.enable_simple_code {
+            self.simple_eval.as_ref().map(|se| se.cached_simple_score).unwrap_or(0.0)
         } else {
-            full_score
-        }
+            0.0
+        };
+
+        let word_score = if ctx.enable_word_code {
+            self.word_eval.as_ref().map(|we| we.compute_word_score(ctx)).unwrap_or(0.0)
+        } else {
+            0.0
+        };
+
+        ctx.weights.weight_full_code * full_score
+            + ctx.weights.weight_simple_code * simple_score
+            + ctx.weights.weight_word_code * word_score
     }
 
     /// 获取得分
@@ -801,21 +1070,6 @@ impl Evaluator {
             self.score_dirty = false;
         }
         self.cached_score
-    }
-
-    /// 计算等价值变异系数
-    #[inline(always)]
-    pub fn calc_equiv_cv(&self) -> f64 {
-        let mean = self.total_equiv_weighted * self.inv_total_frequency;
-        if mean <= 0.0 {
-            return 0.0;
-        }
-        let mean_sq = self.total_equiv_sq_weighted * self.inv_total_frequency;
-        let variance = mean_sq - mean * mean;
-        if variance <= 0.0 {
-            return 0.0;
-        }
-        variance.sqrt() / mean
     }
 
     /// 计算分布偏差
@@ -838,13 +1092,13 @@ impl Evaluator {
         dev
     }
 
-    /// 获取评估指标
+    /// 获取全码评估指标
     pub fn get_metrics(&self, ctx: &OptContext) -> Metrics {
         Metrics {
+            top_n_collision_count: self.top_n_collisions,
             collision_count: self.total_collisions,
             collision_rate: self.collision_frequency as f64 * self.inv_total_frequency,
             equiv_mean: self.total_equiv_weighted * self.inv_total_frequency,
-            equiv_cv: self.calc_equiv_cv(),
             dist_deviation: self.calc_distribution_deviation(&ctx.key_dist_config),
         }
     }
@@ -855,6 +1109,15 @@ impl Evaluator {
             se.get_simple_metrics(ctx)
         } else {
             SimpleMetrics::default()
+        }
+    }
+
+    /// 获取词码评估指标
+    pub fn get_word_metrics(&self, ctx: &OptContext) -> WordMetrics {
+        if let Some(ref we) = self.word_eval {
+            we.get_word_metrics(ctx)
+        } else {
+            WordMetrics::default()
         }
     }
 
@@ -904,6 +1167,21 @@ impl Evaluator {
             self.update_char(ctx, assignment, ci);
         }
 
+        // 词码增量更新
+        if ctx.enable_word_code {
+            if let Some(ref mut we) = self.word_eval {
+                let key_delta = new_key as isize - old_key as isize;
+                for &(wi, mask) in &ctx.word_gcm_data[ctx.word_gcm_offsets[r]..ctx.word_gcm_offsets[r + 1]] {
+                    let old_code = we.current_codes[wi];
+                    let new_code = (old_code as isize + mask as isize * key_delta) as usize;
+                    if old_code != new_code {
+                        we.update_word(ctx, wi, old_code, new_code);
+                        we.update_word_equiv(ctx, wi, assignment);
+                    }
+                }
+            }
+        }
+
         self.score_dirty = true;
         let new_score = self.get_score(ctx);
         let delta = new_score - old_score;
@@ -918,6 +1196,21 @@ impl Evaluator {
             assignment[r] = old_key;
             for &ci in &ctx.group_to_chars[r] {
                 self.update_char(ctx, assignment, ci);
+            }
+
+            // 词码回滚
+            if ctx.enable_word_code {
+                if let Some(ref mut we) = self.word_eval {
+                    let key_delta = old_key as isize - new_key as isize;
+                    for &(wi, mask) in &ctx.word_gcm_data[ctx.word_gcm_offsets[r]..ctx.word_gcm_offsets[r + 1]] {
+                        let cur_code = we.current_codes[wi];
+                        let orig_code = (cur_code as isize + mask as isize * key_delta) as usize;
+                        if cur_code != orig_code {
+                            we.update_word(ctx, wi, cur_code, orig_code);
+                            we.update_word_equiv(ctx, wi, assignment);
+                        }
+                    }
+                }
             }
 
             self.cached_score = old_score;
@@ -962,6 +1255,24 @@ impl Evaluator {
             self.update_char(ctx, assignment, ci);
         }
 
+        // 词码增量更新
+        if ctx.enable_word_code {
+            if let Some(ref mut we) = self.word_eval {
+                for &r in &[r1, r2] {
+                    let (old_k, new_k) = if r == r1 { (k1, k2) } else { (k2, k1) };
+                    let key_delta = new_k as isize - old_k as isize;
+                    for &(wi, mask) in &ctx.word_gcm_data[ctx.word_gcm_offsets[r]..ctx.word_gcm_offsets[r + 1]] {
+                        let old_code = we.current_codes[wi];
+                        let new_code = (old_code as isize + mask as isize * key_delta) as usize;
+                        if old_code != new_code {
+                            we.update_word(ctx, wi, old_code, new_code);
+                            we.update_word_equiv(ctx, wi, assignment);
+                        }
+                    }
+                }
+            }
+        }
+
         self.score_dirty = true;
         let new_score = self.get_score(ctx);
         let delta = new_score - old_score;
@@ -982,6 +1293,24 @@ impl Evaluator {
             }
             for &ci in &ctx.group_to_chars[r2] {
                 self.update_char(ctx, assignment, ci);
+            }
+
+            // 词码回滚
+            if ctx.enable_word_code {
+                if let Some(ref mut we) = self.word_eval {
+                    for &r in &[r1, r2] {
+                        let (old_k, new_k) = if r == r1 { (k2, k1) } else { (k1, k2) };
+                        let key_delta = new_k as isize - old_k as isize;
+                        for &(wi, mask) in &ctx.word_gcm_data[ctx.word_gcm_offsets[r]..ctx.word_gcm_offsets[r + 1]] {
+                            let cur_code = we.current_codes[wi];
+                            let orig_code = (cur_code as isize + mask as isize * key_delta) as usize;
+                            if cur_code != orig_code {
+                                we.update_word(ctx, wi, cur_code, orig_code);
+                                we.update_word_equiv(ctx, wi, assignment);
+                            }
+                        }
+                    }
+                }
             }
 
             self.cached_score = old_score;
@@ -1016,7 +1345,7 @@ impl Evaluator {
             let key_delta = new_key as isize - old_key as isize;
             let mut delta_collisions: i32 = 0;
 
-            for &(ci, mask) in &ctx.group_char_masks[r] {
+            for &(ci, mask) in &ctx.gcm_data[ctx.gcm_offsets[r]..ctx.gcm_offsets[r + 1]] {
                 let old_code = self.current_codes[ci];
                 let new_code = (old_code as isize + mask as isize * key_delta) as usize;
 
@@ -1034,7 +1363,7 @@ impl Evaluator {
             }
 
             // 回滚
-            for &(ci, mask) in &ctx.group_char_masks[r] {
+            for &(ci, mask) in &ctx.gcm_data[ctx.gcm_offsets[r]..ctx.gcm_offsets[r + 1]] {
                 let cur_code = self.current_codes[ci];
                 let orig_code = (cur_code as isize - mask as isize * key_delta) as usize;
 
@@ -1049,8 +1378,8 @@ impl Evaluator {
 
             // delta_score = weight * scale * delta_collisions
             return delta_collisions as f64
-                * ctx.weights.weight_collision_count
-                * ctx.scale_config.collision_count;
+                * ctx.weights.full_collision_count
+                * ctx.scale_config.full_collision_count;
         }
 
         // 通用路径：多目标优化
@@ -1101,7 +1430,7 @@ impl Evaluator {
 
             // 第一步：r1 从 k1 变到 k2
             let key_delta1 = k2 as isize - k1 as isize;
-            for &(ci, mask) in &ctx.group_char_masks[r1] {
+            for &(ci, mask) in &ctx.gcm_data[ctx.gcm_offsets[r1]..ctx.gcm_offsets[r1 + 1]] {
                 let old_code = self.current_codes[ci];
                 let new_code = (old_code as isize + mask as isize * key_delta1) as usize;
 
@@ -1118,7 +1447,7 @@ impl Evaluator {
 
             // 第二步：r2 从 k2 变到 k1
             let key_delta2 = k1 as isize - k2 as isize;
-            for &(ci, mask) in &ctx.group_char_masks[r2] {
+            for &(ci, mask) in &ctx.gcm_data[ctx.gcm_offsets[r2]..ctx.gcm_offsets[r2 + 1]] {
                 let old_code = self.current_codes[ci];
                 let new_code = (old_code as isize + mask as isize * key_delta2) as usize;
 
@@ -1134,7 +1463,7 @@ impl Evaluator {
             }
 
             // 回滚 r2
-            for &(ci, mask) in &ctx.group_char_masks[r2] {
+            for &(ci, mask) in &ctx.gcm_data[ctx.gcm_offsets[r2]..ctx.gcm_offsets[r2 + 1]] {
                 let cur_code = self.current_codes[ci];
                 let orig_code = (cur_code as isize - mask as isize * key_delta2) as usize;
 
@@ -1144,7 +1473,7 @@ impl Evaluator {
             }
 
             // 回滚 r1
-            for &(ci, mask) in &ctx.group_char_masks[r1] {
+            for &(ci, mask) in &ctx.gcm_data[ctx.gcm_offsets[r1]..ctx.gcm_offsets[r1 + 1]] {
                 let cur_code = self.current_codes[ci];
                 let orig_code = (cur_code as isize - mask as isize * key_delta1) as usize;
 
@@ -1154,8 +1483,8 @@ impl Evaluator {
             }
 
             return delta_collisions as f64
-                * ctx.weights.weight_collision_count
-                * ctx.scale_config.collision_count;
+                * ctx.weights.full_collision_count
+                * ctx.scale_config.full_collision_count;
         }
 
         // 通用路径：多目标优化
@@ -1215,7 +1544,7 @@ impl Evaluator {
         // 快速路径
         if !ctx.need_bucket_members && !ctx.need_equiv {
             let key_delta = new_key as isize - old_key as isize;
-            for &(ci, mask) in &ctx.group_char_masks[r] {
+            for &(ci, mask) in &ctx.gcm_data[ctx.gcm_offsets[r]..ctx.gcm_offsets[r + 1]] {
                 let old_code = self.current_codes[ci];
                 let new_code = (old_code as isize + mask as isize * key_delta) as usize;
 
@@ -1266,7 +1595,7 @@ impl Evaluator {
         // 快速路径
         if !ctx.need_bucket_members && !ctx.need_equiv {
             let key_delta1 = k2 as isize - k1 as isize;
-            for &(ci, mask) in &ctx.group_char_masks[r1] {
+            for &(ci, mask) in &ctx.gcm_data[ctx.gcm_offsets[r1]..ctx.gcm_offsets[r1 + 1]] {
                 let old_code = self.current_codes[ci];
                 let new_code = (old_code as isize + mask as isize * key_delta1) as usize;
 
@@ -1282,7 +1611,7 @@ impl Evaluator {
             }
 
             let key_delta2 = k1 as isize - k2 as isize;
-            for &(ci, mask) in &ctx.group_char_masks[r2] {
+            for &(ci, mask) in &ctx.gcm_data[ctx.gcm_offsets[r2]..ctx.gcm_offsets[r2 + 1]] {
                 let old_code = self.current_codes[ci];
                 let new_code = (old_code as isize + mask as isize * key_delta2) as usize;
 

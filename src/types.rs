@@ -34,6 +34,8 @@ pub const KEY_SPACE: usize = 26;
 pub const EQUIV_TABLE_SIZE: usize = 47;
 /// 分组标记起始值
 pub const GROUP_MARKER: u16 = 1000;
+/// CharInfo.parts 的最大长度（对应 config 中 max_parts 上限）
+pub const MAX_PARTS: usize = 4;
 
 /// 将字符转换为键位索引
 pub fn char_to_key_index(c: char) -> Option<usize> {
@@ -103,84 +105,114 @@ pub fn pow_base(base: usize, exp: usize) -> usize {
 }
 
 /// 权重配置 - 用于得分计算
+/// 三组目标：单字全码 / 单字简码 / 多字词全码，顶层线性组合
 #[derive(Clone, Copy, Debug)]
 pub struct WeightConfig {
-    // 全码权重
-    pub weight_collision_count: f64,
-    pub weight_collision_rate: f64,
-    pub weight_equivalence: f64,
-    pub weight_equiv_cv: f64,
-    pub weight_distribution: f64,
-    // 简码开关与主权重
-    pub enable_simple_code: bool,
+    // ── 顶层权重（三组目标的相对重要性，建议总和为 1.0）──
     pub weight_full_code: f64,
     pub weight_simple_code: f64,
-    // 简码子权重
-    pub simple_weight_freq: f64,
-    pub simple_weight_equiv: f64,
-    pub simple_weight_dist: f64,
-    pub simple_weight_collision_count: f64,
-    pub simple_weight_collision_rate: f64,
+    pub weight_word_code: f64,
+
+    // ── 单字全码子权重 ──
+    /// 字频前 N 重码数的 N 值
+    pub full_top_n: usize,
+    pub full_top_n_collision: f64,
+    pub full_collision_count: f64,
+    pub full_collision_rate: f64,
+    pub full_equivalence: f64,
+    pub full_distribution: f64,
+
+    // ── 单字简码开关与子权重 ──
+    pub enable_simple_code: bool,
+    /// 加权码长（全字符加权平均码长）
+    pub simple_weighted_key_length: f64,
+    pub simple_collision_count: f64,
+    pub simple_collision_rate: f64,
+    pub simple_equivalence: f64,
+    pub simple_distribution: f64,
+
+    // ── 多字词全码开关与子权重 ──
+    pub enable_word_code: bool,
+    pub word_top2000_collision: f64,
+    pub word_top10000_collision: f64,
+    pub word_collision_count: f64,
+    pub word_collision_rate: f64,
+    pub word_equivalence: f64,
+    pub word_distribution: f64,
 }
 
 impl Default for WeightConfig {
     fn default() -> Self {
         Self {
-            weight_collision_count: 0.07,
-            weight_collision_rate: 0.62,
-            weight_equivalence: 0.2,
-            weight_equiv_cv: 0.01,
-            weight_distribution: 0.1,
-            enable_simple_code: true,
-            weight_full_code: 0.7,
+            weight_full_code: 0.5,
             weight_simple_code: 0.3,
-            simple_weight_freq: 0.5,
-            simple_weight_equiv: 0.15,
-            simple_weight_dist: 0.05,
-            simple_weight_collision_count: 0.05,
-            simple_weight_collision_rate: 0.25,
+            weight_word_code: 0.2,
+            full_top_n: 1500,
+            full_top_n_collision: 0.1,
+            full_collision_count: 0.1,
+            full_collision_rate: 0.3,
+            full_equivalence: 0.3,
+            full_distribution: 0.2,
+            enable_simple_code: true,
+            simple_weighted_key_length: 0.3,
+            simple_collision_count: 0.1,
+            simple_collision_rate: 0.2,
+            simple_equivalence: 0.2,
+            simple_distribution: 0.2,
+            enable_word_code: false,
+            word_top2000_collision: 0.2,
+            word_top10000_collision: 0.1,
+            word_collision_count: 0.1,
+            word_collision_rate: 0.3,
+            word_equivalence: 0.2,
+            word_distribution: 0.1,
         }
     }
 }
 
-/// 缩放配置 - 用于将不同量纲的指标归一化
+/// 缩放配置 - 用于将不同量纲的指标归一化（由 calibrate_scales 自动设置）
 #[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct ScaleConfig {
-    /// 重码数缩放因子
-    pub collision_count: f64,
-    /// 重码率缩放因子
-    pub collision_rate: f64,
-    /// 当量缩放因子
-    pub equivalence: f64,
-    /// 当量变异系数缩放因子
-    pub equiv_cv: f64,
-    /// 分布偏差缩放因子
-    pub distribution: f64,
-    /// 简码频率覆盖缩放因子
-    pub simple_freq: f64,
-    /// 简码当量缩放因子
-    pub simple_equiv: f64,
-    /// 简码分布缩放因子
-    pub simple_dist: f64,
-    /// 简码重码数缩放因子
+    // 单字全码
+    pub full_top_n_collision: f64,
+    pub full_collision_count: f64,
+    pub full_collision_rate: f64,
+    pub full_equivalence: f64,
+    pub full_distribution: f64,
+    // 单字简码
+    pub simple_weighted_key_length: f64,
     pub simple_collision_count: f64,
-    /// 简码重码率缩放因子
     pub simple_collision_rate: f64,
+    pub simple_equivalence: f64,
+    pub simple_distribution: f64,
+    // 多字词全码
+    pub word_top2000_collision: f64,
+    pub word_top10000_collision: f64,
+    pub word_collision_count: f64,
+    pub word_collision_rate: f64,
+    pub word_equivalence: f64,
+    pub word_distribution: f64,
 }
 
 impl Default for ScaleConfig {
     fn default() -> Self {
         Self {
-            collision_count: 1.0,
-            collision_rate: 1.0,
-            equivalence: 1.0,
-            equiv_cv: 1.0,
-            distribution: 1.0,
-            simple_freq: 1.0,
-            simple_equiv: 1.0,
-            simple_dist: 1.0,
+            full_top_n_collision: 1.0,
+            full_collision_count: 1.0,
+            full_collision_rate: 1.0,
+            full_equivalence: 1.0,
+            full_distribution: 1.0,
+            simple_weighted_key_length: 1.0,
             simple_collision_count: 1.0,
             simple_collision_rate: 1.0,
+            simple_equivalence: 1.0,
+            simple_distribution: 1.0,
+            word_top2000_collision: 1.0,
+            word_top10000_collision: 1.0,
+            word_collision_count: 1.0,
+            word_collision_rate: 1.0,
+            word_equivalence: 1.0,
+            word_distribution: 1.0,
         }
     }
 }
@@ -197,39 +229,25 @@ pub struct KeyDistConfig {
 }
 
 /// 汉字拆分信息
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct CharInfo {
-    /// 拆分后的字根列表（键位索引或分组标记）
-    pub parts: Vec<u16>,
+    /// 拆分后的字根列表（键位索引或分组标记），固定大小避免堆分配
+    pub parts: [u16; MAX_PARTS],
+    /// parts 的实际长度
+    pub parts_len: u8,
     /// 使用频率
     pub frequency: u64,
     /// 当前编码值（用于增量更新）
     #[allow(dead_code)]
     pub current_code: usize,
     /// 预计算的键位索引（分配时从 assignment 解析），用于快速增量更新
-    pub current_key_indices: Vec<u16>,
+    pub current_key_indices: [u16; MAX_PARTS],
 }
 
 impl CharInfo {
-    /// 从 parts 和 assignment 计算当前 key_indices
-    #[allow(dead_code)]
-    pub fn update_key_indices(&mut self, ctx: &crate::context::OptContext, assignment: &[u8]) {
-        self.current_key_indices.clear();
-        for &p in &self.parts {
-            let k = ctx.resolve_key(p, assignment);
-            self.current_key_indices.push(k as u16);
-        }
-    }
-
-    /// 从 parts 和 assignment 计算当前 key_indices（使用缓冲区）
-    #[allow(dead_code)]
-    pub fn update_key_indices_with_buf(&mut self, ctx: &crate::context::OptContext, assignment: &[u8], buf: &mut Vec<u16>) {
-        buf.clear();
-        for &p in &self.parts {
-            let k = ctx.resolve_key(p, assignment);
-            buf.push(k as u16);
-        }
-        std::mem::swap(&mut self.current_key_indices, buf);
+    #[inline]
+    pub fn parts_slice(&self) -> &[u16] {
+        &self.parts[..self.parts_len as usize]
     }
 }
 
@@ -242,34 +260,78 @@ pub struct RootGroup {
     pub allowed_keys: Vec<u8>,
 }
 
-/// 评估指标
+/// 单字全码评估指标
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Metrics {
-    /// 重码数
+    /// 字频前 N 重码数
+    pub top_n_collision_count: usize,
+    /// 总重码数
     pub collision_count: usize,
     /// 重码率
     pub collision_rate: f64,
-    /// 平均当量
+    /// 加权平均当量
     pub equiv_mean: f64,
-    /// 当量变异系数
-    pub equiv_cv: f64,
-    /// 分布偏差
+    /// 键位分布偏差
     pub dist_deviation: f64,
 }
 
-/// 简码评估指标
+/// 单字简码评估指标
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
 pub struct SimpleMetrics {
-    /// 频率覆盖率
-    pub weighted_freq_coverage: f64,
-    /// 平均当量
+    /// 全字符加权平均码长（出简字取简码长，否则取全码长）
+    pub weighted_key_length: f64,
+    /// 加权平均当量
     pub equiv_mean: f64,
-    /// 分布偏差
+    /// 键位分布偏差
     pub dist_deviation: f64,
     /// 重码数
     pub collision_count: usize,
     /// 重码率
     pub collision_rate: f64,
+}
+
+/// 多字词全码评估指标
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+pub struct WordMetrics {
+    /// 词频前 2000 重码数
+    pub top2000_collision_count: usize,
+    /// 词频前 10000 重码数
+    pub top10000_collision_count: usize,
+    /// 总重码数
+    pub collision_count: usize,
+    /// 重码率
+    pub collision_rate: f64,
+    /// 加权平均当量
+    pub equiv_mean: f64,
+    /// 键位分布偏差
+    pub dist_deviation: f64,
+}
+
+/// 多字词拆分信息（与 CharInfo 结构相同，额外标记词频排名）
+#[derive(Clone, Copy)]
+pub struct WordInfo {
+    /// 拆分后的字根列表（键位索引或分组标记）
+    pub parts: [u16; MAX_PARTS],
+    /// parts 的实际长度
+    pub parts_len: u8,
+    /// 词频
+    pub frequency: u64,
+    /// 当前编码值
+    #[allow(dead_code)]
+    pub current_code: usize,
+    /// 预计算的键位索引
+    pub current_key_indices: [u16; MAX_PARTS],
+    /// 是否在词频前 2000
+    pub is_top2000: bool,
+    /// 是否在词频前 10000
+    pub is_top10000: bool,
+}
+
+impl WordInfo {
+    #[inline]
+    pub fn parts_slice(&self) -> &[u16] {
+        &self.parts[..self.parts_len as usize]
+    }
 }
 
 /// 简码步骤 - 选择哪个逻辑根的哪个编码
@@ -290,6 +352,8 @@ pub struct SimpleCodeLevel {
     pub code_num: usize,
     /// 候选规则列表
     pub rule_candidates: Vec<Vec<SimpleCodeStep>>,
+    /// 允许出简码的全码码长（0 = 不限制）
+    pub allowed_orig_length: usize,
 }
 
 /// 简码配置

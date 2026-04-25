@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 
-use crate::types::{char_to_key_index, KeyDistConfig, RootGroup, EQUIV_TABLE_SIZE};
+use crate::types::{char_to_key_index, KeyDistConfig, RootGroup, WordInfo, EQUIV_TABLE_SIZE, GROUP_MARKER, MAX_PARTS};
 
 /// 加载固定字根和受限字根组
 /// 
@@ -299,4 +299,86 @@ pub fn load_key_distribution(path: &str) -> [KeyDistConfig; EQUIV_TABLE_SIZE] {
         }
     }
     cfg
+}
+
+/// 加载多字词拆分表，返回按词频降序排列的 WordInfo 列表
+///
+/// 格式：词\t字根1 字根2 ...\t词频
+/// 字根序列直接用于编码（与单字全码相同逻辑，取前 max_parts 个字根）
+pub fn load_word_divisions(
+    path: &str,
+    fixed_roots: &HashMap<String, u8>,
+    root_to_group: &HashMap<String, usize>,
+    max_parts: usize,
+) -> Vec<WordInfo> {
+    use crate::types::extract_base_name;
+
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("⚠️ 无法读取词码拆分文件 {}: {}", path, e);
+            return Vec::new();
+        }
+    };
+
+    let mut raw: Vec<(Vec<String>, u64)> = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let roots: Vec<String> = parts[1].split_whitespace().map(|s| s.to_string()).collect();
+        let freq: u64 = if parts.len() >= 3 {
+            parts[2].trim().parse().unwrap_or(1)
+        } else {
+            1
+        };
+        if !roots.is_empty() {
+            raw.push((roots, freq));
+        }
+    }
+
+    // 按词频降序排列，用于标记 top-2000 / top-10000
+    raw.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut result = Vec::with_capacity(raw.len());
+    for (rank, (roots, freq)) in raw.into_iter().enumerate() {
+        let mut info = WordInfo {
+            parts: [0u16; MAX_PARTS],
+            parts_len: 0,
+            frequency: freq,
+            current_code: 0,
+            current_key_indices: [0u16; MAX_PARTS],
+            is_top2000: rank < 2000,
+            is_top10000: rank < 10000,
+        };
+
+        for root in &roots {
+            let idx = info.parts_len as usize;
+            if idx >= max_parts {
+                break;
+            }
+            let base = extract_base_name(root);
+            if let Some(&key) = fixed_roots.get(root).or_else(|| fixed_roots.get(&base)) {
+                info.parts[idx] = key as u16;
+                info.current_key_indices[idx] = key as u16;
+                info.parts_len += 1;
+            } else if let Some(&gi) = root_to_group.get(root).or_else(|| root_to_group.get(&base)) {
+                info.parts[idx] = gi as u16 + GROUP_MARKER;
+                info.current_key_indices[idx] = gi as u16 + GROUP_MARKER;
+                info.parts_len += 1;
+            }
+            // 未知字根跳过（不增加 parts_len）
+        }
+
+        if info.parts_len > 0 {
+            result.push(info);
+        }
+    }
+
+    result
 }

@@ -2,60 +2,71 @@
 // 📐 自动校准模块
 // =========================================================================
 
-use crate::types::{Metrics, ScaleConfig, SimpleMetrics, WeightConfig};
+use crate::types::{Metrics, ScaleConfig, SimpleMetrics, WeightConfig, WordMetrics};
 
 /// 根据初始状态自动校准缩放因子
-/// 
-/// 使得不同量纲的指标在得分计算中具有相当的权重
+///
+/// 使得不同量纲的指标在得分计算中具有相当的权重（各指标初始贡献 ≈ 1.0）
 pub fn calibrate_scales(
     initial_metrics: &Metrics,
     initial_simple: &SimpleMetrics,
+    initial_word: &WordMetrics,
     weights: &WeightConfig,
 ) -> ScaleConfig {
     let eps = 1e-9;
 
-    // 计算活跃的全码指标数量
-    let active_count = [
-        weights.weight_collision_count,
-        weights.weight_collision_rate,
-        weights.weight_equivalence,
-        weights.weight_equiv_cv,
-        weights.weight_distribution,
-    ]
-    .iter()
-    .filter(|&&w| w > 0.0)
-    .count();
+    // ── 全码缩放 ──
+    let full_top_n_collision = 1.0 / (initial_metrics.top_n_collision_count as f64 + eps);
+    let full_collision_count = 1.0 / (initial_metrics.collision_count as f64 + eps);
+    let full_collision_rate = 1.0 / (initial_metrics.collision_rate + eps);
+    let full_equivalence = 1.0 / (initial_metrics.equiv_mean + eps);
+    let full_distribution = 1.0 / (initial_metrics.dist_deviation + eps);
 
-    // 如果只有一个活跃指标，使用默认缩放
-    let base = if active_count <= 1 {
-        ScaleConfig::default()
+    // ── 简码缩放 ──
+    let (simple_weighted_key_length, simple_collision_count, simple_collision_rate,
+         simple_equivalence, simple_distribution) = if weights.enable_simple_code {
+        (
+            1.0 / (initial_simple.weighted_key_length + eps),
+            1.0 / (initial_simple.collision_count as f64 + eps),
+            1.0 / (initial_simple.collision_rate + eps),
+            1.0 / (initial_simple.equiv_mean + eps),
+            1.0 / (initial_simple.dist_deviation + eps),
+        )
     } else {
-        // 根据初始值计算缩放因子
-        ScaleConfig {
-            collision_count: 1.0 / (initial_metrics.collision_count as f64 + eps),
-            collision_rate: 1.0 / (initial_metrics.collision_rate + eps),
-            equivalence: 1.0 / (initial_metrics.equiv_mean + eps),
-            equiv_cv: 1.0 / (initial_metrics.equiv_cv + eps),
-            distribution: 1.0 / (initial_metrics.dist_deviation + eps),
-            ..ScaleConfig::default()
-        }
+        (1.0, 1.0, 1.0, 1.0, 1.0)
     };
 
-    // 如果未启用简码，返回基础配置
-    if !weights.enable_simple_code {
-        return base;
-    }
+    // ── 词码缩放 ──
+    let (word_top2000_collision, word_top10000_collision, word_collision_count,
+         word_collision_rate, word_equivalence, word_distribution) = if weights.enable_word_code {
+        (
+            1.0 / (initial_word.top2000_collision_count as f64 + eps),
+            1.0 / (initial_word.top10000_collision_count as f64 + eps),
+            1.0 / (initial_word.collision_count as f64 + eps),
+            1.0 / (initial_word.collision_rate + eps),
+            1.0 / (initial_word.equiv_mean + eps),
+            1.0 / (initial_word.dist_deviation + eps),
+        )
+    } else {
+        (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    };
 
-    // 简码频率覆盖损失 = 1 - 覆盖率
-    let freq_coverage_loss = 1.0 - initial_simple.weighted_freq_coverage;
-    
-    // 合并简码缩放因子
     ScaleConfig {
-        simple_freq: 1.0 / (freq_coverage_loss + eps),
-        simple_equiv: 1.0 / (initial_simple.equiv_mean + eps),
-        simple_dist: 1.0 / (initial_simple.dist_deviation + eps),
-        simple_collision_count: 1.0 / (initial_simple.collision_count as f64 + eps),
-        simple_collision_rate: 1.0 / (initial_simple.collision_rate + eps),
-        ..base
+        full_top_n_collision,
+        full_collision_count,
+        full_collision_rate,
+        full_equivalence,
+        full_distribution,
+        simple_weighted_key_length,
+        simple_collision_count,
+        simple_collision_rate,
+        simple_equivalence,
+        simple_distribution,
+        word_top2000_collision,
+        word_top10000_collision,
+        word_collision_count,
+        word_collision_rate,
+        word_equivalence,
+        word_distribution,
     }
 }

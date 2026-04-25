@@ -5,30 +5,22 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::types::{Metrics, ScaleConfig, SimpleMetrics};
+use crate::types::{Metrics, ScaleConfig, SimpleMetrics, WordMetrics};
 
 /// 单个 SA 线程的检查点状态
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ThreadCheckpoint {
-    /// 线程 ID
     pub thread_id: usize,
-    /// 当前解（group → key 映射）
     pub assignment: Vec<u8>,
-    /// 历史最优解
     pub best_assignment: Vec<u8>,
-    /// 历史最优得分
     pub best_score: f64,
-    /// 历史最优指标
     pub best_metrics: Metrics,
-    /// 历史最优简码指标
     pub best_simple_metrics: SimpleMetrics,
-    /// 当前已完成的步数
+    #[serde(default)]
+    pub best_word_metrics: WordMetrics,
     pub current_step: usize,
-    /// 温度乘数（重热状态）
     pub temp_multiplier: f64,
-    /// 连续未改进步数
     pub steps_since_improve: usize,
-    /// 上次报告的最优得分
     pub last_best_score: f64,
 }
 

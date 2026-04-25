@@ -1,7 +1,3 @@
-// =========================================================================
-// 🔧 配置模块
-// =========================================================================
-
 use serde::Deserialize;
 use std::fs;
 
@@ -30,6 +26,9 @@ pub struct FilesConfig {
     pub splits: String,
     pub pair_equiv: String,
     pub key_dist: String,
+    /// 多字词拆分文件（可选，启用词码优化时需要）
+    #[serde(default)]
+    pub word_div: Option<String>,
 }
 
 /// 键位配置
@@ -39,35 +38,89 @@ pub struct KeysConfig {
     pub display_order: String,
 }
 
-/// 权重配置
+/// 权重配置（顶层）
+/// TOML 格式：
+///   [weights]
+///   full = 0.5        # 单字全码顶层权重
+///   simple = 0.3      # 单字简码顶层权重
+///   word = 0.2        # 多字词全码顶层权重
+///   [weights.full_code]   # 单字全码子权重
+///   [weights.simple_code] # 单字简码子权重
+///   [weights.word_code]   # 多字词全码子权重
 #[derive(Debug, Clone, Deserialize)]
 pub struct WeightsConfig {
+    /// 单字全码顶层权重
+    #[serde(default = "default_w_full")]
+    pub full: f64,
+    /// 单字简码顶层权重
+    #[serde(default = "default_w_simple")]
+    pub simple: f64,
+    /// 多字词全码顶层权重
+    #[serde(default)]
+    pub word: f64,
+    /// 单字全码子权重
     pub full_code: FullCodeWeights,
+    /// 单字简码子权重
     pub simple_code: SimpleCodeWeights,
+    /// 多字词全码子权重
+    #[serde(default)]
+    pub word_code: WordCodeWeights,
 }
 
-/// 全码权重
+fn default_w_full() -> f64 { 0.5 }
+fn default_w_simple() -> f64 { 0.3 }
+
+/// 单字全码子权重
 #[derive(Debug, Clone, Deserialize)]
 pub struct FullCodeWeights {
+    /// 字频前 N 重码数的 N 值
+    #[serde(default = "default_top_n")]
+    pub top_n: usize,
+    pub top_n_collision_count: f64,
     pub collision_count: f64,
     pub collision_rate: f64,
     pub equivalence: f64,
-    pub equiv_cv: f64,
     pub distribution: f64,
 }
 
-/// 简码权重
+fn default_top_n() -> usize { 1500 }
+
+/// 单字简码子权重
 #[derive(Debug, Clone, Deserialize)]
 pub struct SimpleCodeWeights {
     pub enabled: bool,
-    pub full_code_weight: f64,
-    pub simple_code_weight: f64,
-    pub freq: f64,
-    pub equiv: f64,
-    pub dist: f64,
+    pub weighted_key_length: f64,
     pub collision_count: f64,
     pub collision_rate: f64,
+    pub equivalence: f64,
+    pub distribution: f64,
 }
+
+/// 多字词全码子权重
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct WordCodeWeights {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_word_top2000")]
+    pub top2000_collision_count: f64,
+    #[serde(default = "default_word_top10000")]
+    pub top10000_collision_count: f64,
+    #[serde(default = "default_word_collision_count")]
+    pub collision_count: f64,
+    #[serde(default = "default_word_collision_rate")]
+    pub collision_rate: f64,
+    #[serde(default = "default_word_equivalence")]
+    pub equivalence: f64,
+    #[serde(default = "default_word_distribution")]
+    pub distribution: f64,
+}
+
+fn default_word_top2000() -> f64 { 0.2 }
+fn default_word_top10000() -> f64 { 0.1 }
+fn default_word_collision_count() -> f64 { 0.1 }
+fn default_word_collision_rate() -> f64 { 0.3 }
+fn default_word_equivalence() -> f64 { 0.2 }
+fn default_word_distribution() -> f64 { 0.1 }
 
 /// 模拟退火参数配置
 #[derive(Debug, Clone, Deserialize)]
@@ -128,6 +181,8 @@ pub struct SimpleLevelConfig {
     pub level: usize,
     pub code_num: usize,
     pub rules: Vec<String>,
+    #[serde(default)]
+    pub allowed_orig_length: usize,
 }
 
 // =========================================================================
@@ -180,6 +235,7 @@ impl Config {
                     level: l.level,
                     code_num: l.code_num,
                     rule_candidates,
+                    allowed_orig_length: l.allowed_orig_length,
                 }
             })
             .filter(|l| !l.rule_candidates.is_empty())
@@ -190,37 +246,42 @@ impl Config {
 
     /// 验证权重配置是否合理
     pub fn validate_weights(&self) {
-        let total_full = self.weights.full_code.collision_count
-            + self.weights.full_code.collision_rate
-            + self.weights.full_code.equivalence
-            + self.weights.full_code.equiv_cv
-            + self.weights.full_code.distribution;
+        let w = &self.weights;
+        let total_full = w.full_code.top_n_collision_count
+            + w.full_code.collision_count
+            + w.full_code.collision_rate
+            + w.full_code.equivalence
+            + w.full_code.distribution;
         if (total_full - 1.0).abs() > 0.001 {
-            eprintln!(
-                "⚠️ 警告：全码权重总和不为 1.0 (当前: {:.3})",
-                total_full
-            );
+            eprintln!("⚠️ 警告：全码子权重总和不为 1.0 (当前: {:.3})", total_full);
         }
 
-        let total_simple = self.weights.simple_code.freq
-            + self.weights.simple_code.equiv
-            + self.weights.simple_code.dist
-            + self.weights.simple_code.collision_count
-            + self.weights.simple_code.collision_rate;
-        if self.weights.simple_code.enabled && (total_simple - 1.0).abs() > 0.001 {
-            eprintln!(
-                "⚠️ 警告：简码子权重总和不为 1.0 (当前: {:.3})",
-                total_simple
-            );
+        if w.simple_code.enabled {
+            let total_simple = w.simple_code.weighted_key_length
+                + w.simple_code.collision_count
+                + w.simple_code.collision_rate
+                + w.simple_code.equivalence
+                + w.simple_code.distribution;
+            if (total_simple - 1.0).abs() > 0.001 {
+                eprintln!("⚠️ 警告：简码子权重总和不为 1.0 (当前: {:.3})", total_simple);
+            }
         }
 
-        let total_main = self.weights.simple_code.full_code_weight
-            + self.weights.simple_code.simple_code_weight;
-        if self.weights.simple_code.enabled && (total_main - 1.0).abs() > 0.001 {
-            eprintln!(
-                "⚠️ 警告：全码/简码总权重不为 1.0 (当前: {:.3})",
-                total_main
-            );
+        if w.word_code.enabled {
+            let total_word = w.word_code.top2000_collision_count
+                + w.word_code.top10000_collision_count
+                + w.word_code.collision_count
+                + w.word_code.collision_rate
+                + w.word_code.equivalence
+                + w.word_code.distribution;
+            if (total_word - 1.0).abs() > 0.001 {
+                eprintln!("⚠️ 警告：词码子权重总和不为 1.0 (当前: {:.3})", total_word);
+            }
+        }
+
+        let total_top = w.full + w.simple + w.word;
+        if (total_top - 1.0).abs() > 0.001 {
+            eprintln!("⚠️ 警告：顶层权重总和不为 1.0 (当前: {:.3})", total_top);
         }
     }
 
@@ -236,20 +297,30 @@ impl Config {
 
     /// 获取权重配置
     pub fn get_weight_config(&self) -> WeightConfig {
+        let w = &self.weights;
         WeightConfig {
-            weight_collision_count: self.weights.full_code.collision_count,
-            weight_collision_rate: self.weights.full_code.collision_rate,
-            weight_equivalence: self.weights.full_code.equivalence,
-            weight_equiv_cv: self.weights.full_code.equiv_cv,
-            weight_distribution: self.weights.full_code.distribution,
-            enable_simple_code: self.weights.simple_code.enabled,
-            weight_full_code: self.weights.simple_code.full_code_weight,
-            weight_simple_code: self.weights.simple_code.simple_code_weight,
-            simple_weight_freq: self.weights.simple_code.freq,
-            simple_weight_equiv: self.weights.simple_code.equiv,
-            simple_weight_dist: self.weights.simple_code.dist,
-            simple_weight_collision_count: self.weights.simple_code.collision_count,
-            simple_weight_collision_rate: self.weights.simple_code.collision_rate,
+            weight_full_code: w.full,
+            weight_simple_code: w.simple,
+            weight_word_code: w.word,
+            full_top_n: w.full_code.top_n,
+            full_top_n_collision: w.full_code.top_n_collision_count,
+            full_collision_count: w.full_code.collision_count,
+            full_collision_rate: w.full_code.collision_rate,
+            full_equivalence: w.full_code.equivalence,
+            full_distribution: w.full_code.distribution,
+            enable_simple_code: w.simple_code.enabled,
+            simple_weighted_key_length: w.simple_code.weighted_key_length,
+            simple_collision_count: w.simple_code.collision_count,
+            simple_collision_rate: w.simple_code.collision_rate,
+            simple_equivalence: w.simple_code.equivalence,
+            simple_distribution: w.simple_code.distribution,
+            enable_word_code: w.word_code.enabled,
+            word_top2000_collision: w.word_code.top2000_collision_count,
+            word_top10000_collision: w.word_code.top10000_collision_count,
+            word_collision_count: w.word_code.collision_count,
+            word_collision_rate: w.word_code.collision_rate,
+            word_equivalence: w.word_code.equivalence,
+            word_distribution: w.word_code.distribution,
         }
     }
 }
@@ -284,29 +355,33 @@ impl Default for Config {
                 splits: "input-division.txt".to_string(),
                 pair_equiv: "pair_equivalence.txt".to_string(),
                 key_dist: "key_distribution.txt".to_string(),
+                word_div: None,
             },
             keys: KeysConfig {
                 allowed: "qwertyuiopasdfghjklzxcvbnm".to_string(),
                 display_order: "qwertyuiopasdfghjklzxcvbnm".to_string(),
             },
             weights: WeightsConfig {
+                full: 0.5,
+                simple: 0.3,
+                word: 0.0,
                 full_code: FullCodeWeights {
-                    collision_count: 0.07,
-                    collision_rate: 0.62,
-                    equivalence: 0.2,
-                    equiv_cv: 0.01,
-                    distribution: 0.1,
+                    top_n: 1500,
+                    top_n_collision_count: 0.1,
+                    collision_count: 0.1,
+                    collision_rate: 0.3,
+                    equivalence: 0.3,
+                    distribution: 0.2,
                 },
                 simple_code: SimpleCodeWeights {
                     enabled: true,
-                    full_code_weight: 0.7,
-                    simple_code_weight: 0.3,
-                    freq: 0.5,
-                    equiv: 0.15,
-                    dist: 0.05,
-                    collision_count: 0.05,
-                    collision_rate: 0.25,
+                    weighted_key_length: 0.3,
+                    collision_count: 0.1,
+                    collision_rate: 0.2,
+                    equivalence: 0.2,
+                    distribution: 0.2,
                 },
+                word_code: WordCodeWeights::default(),
             },
             annealing: AnnealingConfig {
                 threads: 16,
@@ -342,16 +417,19 @@ impl Default for Config {
                     level: 1,
                     code_num: 0,
                     rules: vec!["Aa".to_string()],
+                    allowed_orig_length: 0,
                 },
                 SimpleLevelConfig {
                     level: 2,
                     code_num: 1,
                     rules: vec!["AaBa".to_string()],
+                    allowed_orig_length: 0,
                 },
                 SimpleLevelConfig {
                     level: 3,
                     code_num: 1,
                     rules: vec!["AaBaCa".to_string()],
+                    allowed_orig_length: 0,
                 },
             ],
         }

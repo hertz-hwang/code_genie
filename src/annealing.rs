@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::context::OptContext;
 use crate::evaluator::Evaluator;
 use crate::schedule::TemperatureSchedule;
-use crate::types::{char_to_key_index, Metrics, SimpleMetrics, GROUP_MARKER, KEY_SPACE};
+use crate::types::{char_to_key_index, Metrics, SimpleMetrics, WordMetrics, GROUP_MARKER, KEY_SPACE};
 
 // =========================================================================
 // 初始化策略
@@ -176,7 +176,7 @@ fn find_collision_groups(
         let mut groups_in_conflict: HashSet<usize> = HashSet::new();
         for &ci in chars {
             let info = &ctx.char_infos[ci];
-            for &p in &info.parts {
+            for &p in info.parts_slice() {
                 if p >= GROUP_MARKER {
                     let gi = (p - GROUP_MARKER) as usize;
                     groups_in_conflict.insert(gi);
@@ -328,7 +328,7 @@ fn try_triple_swap(
         }
         for &ci in &ctx.group_to_chars[gi] {
             let freq_f = ctx.char_infos[ci].frequency as f64;
-            for &p in &ctx.char_infos[ci].parts {
+            for &p in ctx.char_infos[ci].parts_slice() {
                 if p >= GROUP_MARKER && (p - GROUP_MARKER) as usize == gi {
                     evaluator.key_weighted_usage[old_k as usize] -= freq_f;
                     evaluator.key_weighted_usage[new_k as usize] += freq_f;
@@ -363,7 +363,7 @@ fn try_triple_swap(
             }
             for &ci in &ctx.group_to_chars[gi] {
                 let freq_f = ctx.char_infos[ci].frequency as f64;
-                for &p in &ctx.char_infos[ci].parts {
+                for &p in ctx.char_infos[ci].parts_slice() {
                     if p >= GROUP_MARKER && (p - GROUP_MARKER) as usize == gi {
                         evaluator.key_weighted_usage[old_k as usize] -= freq_f;
                         evaluator.key_weighted_usage[new_k as usize] += freq_f;
@@ -505,7 +505,7 @@ fn coordinate_descent(ctx: &OptContext, init: Vec<u8>) -> (Vec<u8>, f64) {
                 // 增量前向：移动到候选键
                 for &ci in &ctx.group_to_chars[gi] {
                     let freq_f = ctx.char_infos[ci].frequency as f64;
-                    for &p in &ctx.char_infos[ci].parts {
+                    for &p in ctx.char_infos[ci].parts_slice() {
                         if p >= GROUP_MARKER && (p - GROUP_MARKER) as usize == gi {
                             evaluator.key_weighted_usage[assignment[gi] as usize] -= freq_f;
                             evaluator.key_weighted_usage[k as usize] += freq_f;
@@ -529,7 +529,7 @@ fn coordinate_descent(ctx: &OptContext, init: Vec<u8>) -> (Vec<u8>, f64) {
                 // 回滚
                 for &ci in &ctx.group_to_chars[gi] {
                     let freq_f = ctx.char_infos[ci].frequency as f64;
-                    for &p in &ctx.char_infos[ci].parts {
+                    for &p in ctx.char_infos[ci].parts_slice() {
                         if p >= GROUP_MARKER && (p - GROUP_MARKER) as usize == gi {
                             evaluator.key_weighted_usage[k as usize] -= freq_f;
                             evaluator.key_weighted_usage[prev_key as usize] += freq_f;
@@ -548,7 +548,7 @@ fn coordinate_descent(ctx: &OptContext, init: Vec<u8>) -> (Vec<u8>, f64) {
                 // 应用最优移动
                 for &ci in &ctx.group_to_chars[gi] {
                     let freq_f = ctx.char_infos[ci].frequency as f64;
-                    for &p in &ctx.char_infos[ci].parts {
+                    for &p in ctx.char_infos[ci].parts_slice() {
                         if p >= GROUP_MARKER && (p - GROUP_MARKER) as usize == gi {
                             evaluator.key_weighted_usage[current_key as usize] -= freq_f;
                             evaluator.key_weighted_usage[best_key as usize] += freq_f;
@@ -821,11 +821,10 @@ pub struct SaResult {
     pub score: f64,
     pub metrics: Metrics,
     pub simple_metrics: SimpleMetrics,
+    pub word_metrics: WordMetrics,
     /// 若被中断，保存线程检查点
     pub checkpoint: Option<ThreadCheckpoint>,
-    /// 自动校准得到的起始温度（0 表示未校准）
     pub actual_temp_start: f64,
-    /// 自动校准得到的舒适温度（0 表示未校准）
     pub actual_comfort_temp: f64,
 }
 
@@ -861,17 +860,18 @@ pub fn simulated_annealing_resumable(
     let mut best_score;
     let mut best_metrics;
     let mut best_simple_metrics;
+    let mut best_word_metrics;
     let mut temp_multiplier;
     let mut steps_since_improve;
     let mut last_best_score;
 
     if let Some(ckpt) = resume {
-        // 从检查点恢复
         assignment = ckpt.assignment.clone();
         best_assignment = ckpt.best_assignment.clone();
         best_score = ckpt.best_score;
         best_metrics = ckpt.best_metrics;
         best_simple_metrics = ckpt.best_simple_metrics;
+        best_word_metrics = ckpt.best_word_metrics;
         start_step = ckpt.current_step;
         temp_multiplier = ckpt.temp_multiplier;
         steps_since_improve = ckpt.steps_since_improve;
@@ -895,6 +895,7 @@ pub fn simulated_annealing_resumable(
         best_score = evaluator_init.get_score(ctx);
         best_metrics = evaluator_init.get_metrics(ctx);
         best_simple_metrics = evaluator_init.get_simple_metrics(ctx);
+        best_word_metrics = evaluator_init.get_word_metrics(ctx);
         last_best_score = best_score;
 
         if thread_id == 0 {
@@ -916,6 +917,7 @@ pub fn simulated_annealing_resumable(
             score: best_score,
             metrics: best_metrics,
             simple_metrics: best_simple_metrics,
+            word_metrics: best_word_metrics,
             checkpoint: None,
             actual_temp_start: 0.0,
             actual_comfort_temp: 0.0,
@@ -981,6 +983,7 @@ pub fn simulated_annealing_resumable(
                 best_score,
                 best_metrics,
                 best_simple_metrics,
+                best_word_metrics,
                 current_step: step,
                 temp_multiplier,
                 steps_since_improve,
@@ -991,6 +994,7 @@ pub fn simulated_annealing_resumable(
                 score: best_score,
                 metrics: best_metrics,
                 simple_metrics: best_simple_metrics,
+                word_metrics: best_word_metrics,
                 checkpoint: Some(ckpt),
                 actual_temp_start,
                 actual_comfort_temp,
@@ -1046,6 +1050,7 @@ pub fn simulated_annealing_resumable(
             best_assignment = assignment.clone();
             best_metrics = evaluator.get_metrics(ctx);
             best_simple_metrics = evaluator.get_simple_metrics(ctx);
+            best_word_metrics = evaluator.get_word_metrics(ctx);
             steps_since_improve = 0;
 
             if thread_id == 0 && best_score <= last_best_score - 0.9 {
@@ -1149,6 +1154,7 @@ pub fn simulated_annealing_resumable(
         let eval = Evaluator::new(ctx, &best_assignment);
         best_metrics = eval.get_metrics(ctx);
         best_simple_metrics = eval.get_simple_metrics(ctx);
+        best_word_metrics = eval.get_word_metrics(ctx);
 
         if thread_id == 0 {
             println!("   [T0] 最终爬山改进 → 得分: {:.4}", best_score);
@@ -1164,6 +1170,7 @@ pub fn simulated_annealing_resumable(
             let eval = Evaluator::new(ctx, &best_assignment);
             best_metrics = eval.get_metrics(ctx);
             best_simple_metrics = eval.get_simple_metrics(ctx);
+            best_word_metrics = eval.get_word_metrics(ctx);
 
             if thread_id == 0 {
                 println!("   [T0] 坐标下降精炼: {:.4} → {:.4}", score_before_cd, best_score);
@@ -1180,6 +1187,7 @@ pub fn simulated_annealing_resumable(
         score: best_score,
         metrics: best_metrics,
         simple_metrics: best_simple_metrics,
+        word_metrics: best_word_metrics,
         checkpoint: None,
         actual_temp_start,
         actual_comfort_temp,

@@ -37,7 +37,7 @@ use crate::context::OptContext;
 use crate::evaluator::Evaluator;
 use crate::output::{save_results, save_summary, save_thread_results};
 use crate::types::{
-    key_to_char, SimpleCodeConfig, SimpleMetrics, EQUIV_TABLE_SIZE, KeyDistConfig,
+    key_to_char, SimpleCodeConfig, SimpleMetrics, WordMetrics, EQUIV_TABLE_SIZE, KeyDistConfig,
 };
 
 // =========================================================================
@@ -81,6 +81,10 @@ enum Commands {
         /// 编码输出文件
         #[arg(short = 'o', long, default_value = "output-encode.txt")]
         output: String,
+
+        /// 配置文件路径（用于读取 simple_levels，在输出前部插入简码）
+        #[arg(long)]
+        config: Option<String>,
     },
 
     /// 全方位评估编码方案
@@ -147,9 +151,12 @@ fn main() {
             division,
             keymap,
             output,
+            config: encode_config,
         }) => {
             let division_path = division.as_deref().unwrap_or(&cfg.files.splits);
-            run_encode(division_path, &keymap, &output);
+            // 若指定了 --config，加载该配置以获取 simple_levels
+            let encode_cfg = encode_config.as_deref().map(Config::load_from_path);
+            run_encode(division_path, &keymap, &output, encode_cfg.as_ref());
         }
         Some(Commands::Evaluate {
             division,
@@ -185,7 +192,7 @@ fn main() {
 // encode 子命令
 // =========================================================================
 
-fn run_encode(division_path: &str, keymap_path: &str, output_path: &str) {
+fn run_encode(division_path: &str, keymap_path: &str, output_path: &str, cfg: Option<&Config>) {
     println!("=== CodeGenie 编码模式 ===");
     println!("  拆分表: {}", division_path);
     println!("  键位映射: {}", keymap_path);
@@ -197,6 +204,22 @@ fn run_encode(division_path: &str, keymap_path: &str, output_path: &str) {
 
     println!("  已加载 {} 个字根映射", root_to_key.len());
     println!("  已加载 {} 个汉字拆分", splits.len());
+
+    // 若指定了配置文件，先生成简码前缀
+    let mut simple_count = 0usize;
+    let simple_prefix = if let Some(c) = cfg {
+        let simple_config = c.get_simple_code_config();
+        if !simple_config.levels.is_empty() {
+            println!("  简码级别: {} 级", simple_config.levels.len());
+            let (prefix, count) = output::build_simple_prefix_for_encode(&root_to_key, &splits, &simple_config);
+            simple_count = count;
+            prefix
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
 
     // 为每个汉字编码
     let mut code_out = String::new();
@@ -237,10 +260,14 @@ fn run_encode(division_path: &str, keymap_path: &str, output_path: &str) {
         }
     }
 
-    // 写入文件
-    std::fs::write(output_path, &code_out).expect("无法写入编码输出文件");
+    // 写入文件（简码前缀 + 全码）
+    let final_out = format!("{}{}", simple_prefix, code_out);
+    std::fs::write(output_path, &final_out).expect("无法写入编码输出文件");
 
     println!("\n✅ 编码完成:");
+    if simple_count > 0 {
+        println!("  简码条目: {} 条", simple_count);
+    }
     println!("  成功编码: {} 字", encoded_count);
     if failed_count > 0 {
         println!("  ⚠️ 部分编码: {} 字（存在未映射字根）", failed_count);
@@ -323,6 +350,7 @@ fn run_evaluate(
         simple_config,
         weights,
         use_keysoul,
+        vec![],
     );
 
     println!("  编码基数: {}", ctx.code_base);
@@ -333,10 +361,12 @@ fn run_evaluate(
     let evaluator = Evaluator::new(&ctx, &assignment);
     let metrics = evaluator.get_metrics(&ctx);
     let simple_metrics = evaluator.get_simple_metrics(&ctx);
+    let word_metrics = evaluator.get_word_metrics(&ctx);
 
     // 打印评估结果
     println!("\n📊 评估结果:");
     println!("  ═══════════════════════════════════════");
+    println!("  「全码」前{}重码数:        {}", ctx.weights.full_top_n, metrics.top_n_collision_count);
     println!("  「全码」重码数:          {}", metrics.collision_count);
     println!(
         "  「全码」重码率:          {:.6}%",
@@ -345,10 +375,6 @@ fn run_evaluate(
     println!(
         "  「全码」加权键均当量:    {:.4}",
         metrics.equiv_mean
-    );
-    println!(
-        "  「全码」当量变异系数(CV): {:.4}",
-        metrics.equiv_cv
     );
     println!(
         "  「全码」用指分布偏差(L2): {:.4}",
@@ -366,8 +392,8 @@ fn run_evaluate(
             simple_metrics.collision_rate * 100.0
         );
         println!(
-            "  「简码」覆盖率:          {:.4}%",
-            simple_metrics.weighted_freq_coverage * 100.0
+            "  「简码」加权码长:        {:.4}",
+            simple_metrics.weighted_key_length
         );
         println!(
             "  「简码」加权当量:        {:.4}",
@@ -377,6 +403,15 @@ fn run_evaluate(
             "  「简码」分布偏差:        {:.4}",
             simple_metrics.dist_deviation
         );
+    }
+    if ctx.enable_word_code {
+        println!("  ─────────────────────────────────────");
+        println!("  「词码」前2000重码数:     {}", word_metrics.top2000_collision_count);
+        println!("  「词码」前10000重码数:    {}", word_metrics.top10000_collision_count);
+        println!("  「词码」总重码数:         {}", word_metrics.collision_count);
+        println!("  「词码」重码率:           {:.6}%", word_metrics.collision_rate * 100.0);
+        println!("  「词码」加权当量:         {:.4}", word_metrics.equiv_mean);
+        println!("  「词码」分布偏差:         {:.4}", word_metrics.dist_deviation);
     }
     println!("  ═══════════════════════════════════════");
 
@@ -388,6 +423,7 @@ fn run_evaluate(
         &evaluator,
         &metrics,
         &simple_metrics,
+        &word_metrics,
         &key_dist_config,
     );
 
@@ -403,11 +439,11 @@ fn build_evaluate_report(
     evaluator: &Evaluator,
     metrics: &types::Metrics,
     simple_metrics: &SimpleMetrics,
+    word_metrics: &WordMetrics,
     key_dist_config: &[KeyDistConfig; EQUIV_TABLE_SIZE],
 ) -> String {
     let mut out = String::new();
 
-    // ===== 总览 =====
     out.push_str("# CodeGenie 编码方案评估报告\n");
     out.push_str("#\n");
     out.push_str(&format!("# 汉字数量: {}\n", ctx.char_infos.len()));
@@ -420,6 +456,7 @@ fn build_evaluate_report(
     out.push_str("# ═══════════════════════════════════════\n");
     out.push_str("# 全码指标\n");
     out.push_str("# ═══════════════════════════════════════\n");
+    out.push_str(&format!("# 前{}重码数: {}\n", ctx.weights.full_top_n, metrics.top_n_collision_count));
     out.push_str(&format!("# 重码数: {}\n", metrics.collision_count));
     out.push_str(&format!(
         "# 重码率: {:.6}%\n",
@@ -428,10 +465,6 @@ fn build_evaluate_report(
     out.push_str(&format!(
         "# 加权键均当量: {:.4}\n",
         metrics.equiv_mean
-    ));
-    out.push_str(&format!(
-        "# 当量变异系数(CV): {:.4}\n",
-        metrics.equiv_cv
     ));
     out.push_str(&format!(
         "# 用指分布偏差(L2): {:.4}\n",
@@ -444,26 +477,25 @@ fn build_evaluate_report(
         out.push_str("# ═══════════════════════════════════════\n");
         out.push_str("# 简码指标\n");
         out.push_str("# ═══════════════════════════════════════\n");
-        out.push_str(&format!(
-            "# 简码重码数: {}\n",
-            simple_metrics.collision_count
-        ));
-        out.push_str(&format!(
-            "# 简码重码率: {:.6}%\n",
-            simple_metrics.collision_rate * 100.0
-        ));
-        out.push_str(&format!(
-            "# 简码覆盖率: {:.4}%\n",
-            simple_metrics.weighted_freq_coverage * 100.0
-        ));
-        out.push_str(&format!(
-            "# 简码加权当量: {:.4}\n",
-            simple_metrics.equiv_mean
-        ));
-        out.push_str(&format!(
-            "# 简码分布偏差: {:.4}\n",
-            simple_metrics.dist_deviation
-        ));
+        out.push_str(&format!("# 简码重码数: {}\n", simple_metrics.collision_count));
+        out.push_str(&format!("# 简码重码率: {:.6}%\n", simple_metrics.collision_rate * 100.0));
+        out.push_str(&format!("# 简码加权码长: {:.4}\n", simple_metrics.weighted_key_length));
+        out.push_str(&format!("# 简码加权当量: {:.4}\n", simple_metrics.equiv_mean));
+        out.push_str(&format!("# 简码分布偏差: {:.4}\n", simple_metrics.dist_deviation));
+        out.push_str("#\n");
+    }
+
+    // ===== 词码指标 =====
+    if ctx.enable_word_code {
+        out.push_str("# ═══════════════════════════════════════\n");
+        out.push_str("# 词码指标\n");
+        out.push_str("# ═══════════════════════════════════════\n");
+        out.push_str(&format!("# 词码前2000重码数: {}\n", word_metrics.top2000_collision_count));
+        out.push_str(&format!("# 词码前10000重码数: {}\n", word_metrics.top10000_collision_count));
+        out.push_str(&format!("# 词码总重码数: {}\n", word_metrics.collision_count));
+        out.push_str(&format!("# 词码重码率: {:.6}%\n", word_metrics.collision_rate * 100.0));
+        out.push_str(&format!("# 词码加权当量: {:.4}\n", word_metrics.equiv_mean));
+        out.push_str(&format!("# 词码分布偏差: {:.4}\n", word_metrics.dist_deviation));
         out.push_str("#\n");
     }
 
@@ -520,14 +552,6 @@ fn build_evaluate_report(
     out.push_str("# 当量分布\n");
     out.push_str("# ═══════════════════════════════════════\n");
     out.push_str(&format!("# 平均当量: {:.4}\n", metrics.equiv_mean));
-    out.push_str(&format!(
-        "# 变异系数(CV): {:.4}\n",
-        metrics.equiv_cv
-    ));
-    out.push_str(&format!(
-        "# 标准差: {:.4}\n",
-        metrics.equiv_cv * metrics.equiv_mean
-    ));
 
     // 计算每个汉字的当量
     let mut char_equivs: Vec<(char, f64, u64)> = Vec::new();
@@ -613,7 +637,7 @@ fn build_evaluate_report(
         let code_str = if let Some(ci) = first_ci {
             let info = &ctx.char_infos[ci];
             let keys: String = info
-                .parts
+                .parts_slice()
                 .iter()
                 .map(|&p| key_to_char(ctx.resolve_key(p, assignment)))
                 .collect();
@@ -673,29 +697,26 @@ fn run_optimize(cfg: &Config, use_amhb: bool, use_keysoul: bool, cli_config_path
     );
     println!("全局允许键位: {}", cfg.keys.allowed);
     println!(
-        "全码权重: 重码数={:.2}, 重码率={:.2}, 当量={:.2}, CV={:.2}, 分布={:.2}",
+        "全码权重: 前N重码数={:.2}, 重码数={:.2}, 重码率={:.2}, 当量={:.2}, 分布={:.2}",
+        cfg.weights.full_code.top_n_collision_count,
         cfg.weights.full_code.collision_count,
         cfg.weights.full_code.collision_rate,
         cfg.weights.full_code.equivalence,
-        cfg.weights.full_code.equiv_cv,
         cfg.weights.full_code.distribution,
     );
     println!(
-        "简码优化: {} (全码占比={:.0}%, 简码占比={:.0}%)",
-        if cfg.weights.simple_code.enabled {
-            "开启"
-        } else {
-            "关闭"
-        },
-        cfg.weights.simple_code.full_code_weight * 100.0,
-        cfg.weights.simple_code.simple_code_weight * 100.0
+        "简码优化: {} (全码占比={:.0}%, 简码占比={:.0}%, 词码占比={:.0}%)",
+        if cfg.weights.simple_code.enabled { "开启" } else { "关闭" },
+        cfg.weights.full * 100.0,
+        cfg.weights.simple * 100.0,
+        cfg.weights.word * 100.0,
     );
     if cfg.weights.simple_code.enabled {
         println!(
-            "简码子权重: 频率覆盖={:.2}, 当量={:.2}, 分布={:.2}, 重码数={:.2}, 重码率={:.2}",
-            cfg.weights.simple_code.freq,
-            cfg.weights.simple_code.equiv,
-            cfg.weights.simple_code.dist,
+            "简码子权重: 加权码长={:.2}, 当量={:.2}, 分布={:.2}, 重码数={:.2}, 重码率={:.2}",
+            cfg.weights.simple_code.weighted_key_length,
+            cfg.weights.simple_code.equivalence,
+            cfg.weights.simple_code.distribution,
             cfg.weights.simple_code.collision_count,
             cfg.weights.simple_code.collision_rate,
         );
@@ -715,7 +736,7 @@ fn run_optimize(cfg: &Config, use_amhb: bool, use_keysoul: bool, cli_config_path
     }
 
     // 创建输出目录
-    let timestamp = Local::now().format("%Y%m%d%-H%M%S").to_string();
+    let timestamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
     let output_dir = format!("output-{}", timestamp);
     std::fs::create_dir_all(&output_dir).expect("无法创建输出目录");
     println!("输出目录: {}", output_dir);
@@ -785,6 +806,19 @@ fn run_optimize(cfg: &Config, use_amhb: bool, use_keysoul: bool, cli_config_path
         std::process::exit(1);
     }
 
+    // ==================== 加载词码数据 ====================
+    let word_infos_for_calib = if cfg.weights.word_code.enabled {
+        let word_div_path = cfg.files.word_div.as_deref().unwrap_or("input-worddiv.txt");
+        let root_to_group_tmp: std::collections::HashMap<String, usize> = dynamic_groups
+            .iter()
+            .enumerate()
+            .flat_map(|(gi, g)| g.roots.iter().map(move |r| (r.clone(), gi)))
+            .collect();
+        loader::load_word_divisions(word_div_path, &fixed_roots, &root_to_group_tmp, cfg.annealing.max_parts)
+    } else {
+        vec![]
+    };
+
     // ==================== 初始校准 ====================
     println!("\n📐 正在进行初始尺度校准...");
     let temp_scale = types::ScaleConfig::default();
@@ -799,29 +833,29 @@ fn run_optimize(cfg: &Config, use_amhb: bool, use_keysoul: bool, cli_config_path
         simple_config.clone(),
         weights,
         use_keysoul,
+        word_infos_for_calib.clone(),
     );
 
     let initial_assignment = random_init(&temp_ctx);
     let initial_eval = Evaluator::new(&temp_ctx, &initial_assignment);
     let initial_metrics = initial_eval.get_metrics(&temp_ctx);
     let initial_simple_metrics = initial_eval.get_simple_metrics(&temp_ctx);
+    let initial_word_metrics = initial_eval.get_word_metrics(&temp_ctx);
 
     let weights = cfg.get_weight_config();
-    let scale_config = calibrate_scales(&initial_metrics, &initial_simple_metrics, &weights);
+    let scale_config = calibrate_scales(&initial_metrics, &initial_simple_metrics, &initial_word_metrics, &weights);
 
     println!("  初始状态观测:");
     println!(
-        "    重码数: {},  重码率: {:.6}",
+        "    前{}重码数: {},  重码数: {},  重码率: {:.6}",
+        weights.full_top_n, initial_metrics.top_n_collision_count,
         initial_metrics.collision_count, initial_metrics.collision_rate
     );
-    println!(
-        "    当量: {:.4},  CV: {:.4}",
-        initial_metrics.equiv_mean, initial_metrics.equiv_cv
-    );
+    println!("    当量: {:.4}", initial_metrics.equiv_mean);
     if cfg.weights.simple_code.enabled {
         println!(
-            "    简码覆盖: {:.4}%,  简码当量: {:.4},  简码分布: {:.4}",
-            initial_simple_metrics.weighted_freq_coverage * 100.0,
+            "    简码加权码长: {:.4},  简码当量: {:.4},  简码分布: {:.4}",
+            initial_simple_metrics.weighted_key_length,
             initial_simple_metrics.equiv_mean,
             initial_simple_metrics.dist_deviation
         );
@@ -831,22 +865,25 @@ fn run_optimize(cfg: &Config, use_amhb: bool, use_keysoul: bool, cli_config_path
             initial_simple_metrics.collision_rate * 100.0
         );
     }
+    if cfg.weights.word_code.enabled {
+        println!(
+            "    词码前2000重码数: {},  前10000重码数: {},  总重码数: {}",
+            initial_word_metrics.top2000_collision_count,
+            initial_word_metrics.top10000_collision_count,
+            initial_word_metrics.collision_count,
+        );
+    }
     println!("  校准尺度 (Scale):");
-    println!("    CollisionCount: {:.6}", scale_config.collision_count);
-    println!("    CollisionRate:  {:.6}", scale_config.collision_rate);
-    println!("    Equivalence:    {:.6}", scale_config.equivalence);
+    println!("    FullTopN:       {:.6}", scale_config.full_top_n_collision);
+    println!("    FullCollCnt:    {:.6}", scale_config.full_collision_count);
+    println!("    FullCollRate:   {:.6}", scale_config.full_collision_rate);
+    println!("    FullEquiv:      {:.6}", scale_config.full_equivalence);
     if cfg.weights.simple_code.enabled {
-        println!("    SimpleFreq:     {:.6}", scale_config.simple_freq);
-        println!("    SimpleEquiv:    {:.6}", scale_config.simple_equiv);
-        println!("    SimpleDist:     {:.6}", scale_config.simple_dist);
-        println!(
-            "    SimpleCollCnt:  {:.6}",
-            scale_config.simple_collision_count
-        );
-        println!(
-            "    SimpleCollRate: {:.6}",
-            scale_config.simple_collision_rate
-        );
+        println!("    SimpleWKL:      {:.6}", scale_config.simple_weighted_key_length);
+        println!("    SimpleEquiv:    {:.6}", scale_config.simple_equivalence);
+        println!("    SimpleDist:     {:.6}", scale_config.simple_distribution);
+        println!("    SimpleCollCnt:  {:.6}", scale_config.simple_collision_count);
+        println!("    SimpleCollRate: {:.6}", scale_config.simple_collision_rate);
     }
 
     // 逻辑根验证（仅在启用简码时）
@@ -947,6 +984,7 @@ fn run_optimize(cfg: &Config, use_amhb: bool, use_keysoul: bool, cli_config_path
         simple_config,
         weights,
         use_keysoul,
+        word_infos_for_calib,
     );
 
     println!("\n  - 编码基数: {}", ctx.code_base);
@@ -970,7 +1008,7 @@ fn run_optimize(cfg: &Config, use_amhb: bool, use_keysoul: bool, cli_config_path
         });
     }
 
-    let results: Vec<(Vec<u8>, f64, types::Metrics, SimpleMetrics)> = if use_amhb {
+    let results: Vec<(Vec<u8>, f64, types::Metrics, SimpleMetrics, WordMetrics)> = if use_amhb {
         // AMHB 模式 — 分段指数降温（piecewise exponential cooling）
         let segments = cfg.amhb.cooling_segments.clone();
         let next_temp = move |t: f64, _iter: usize, _score: f64| -> f64 {
@@ -999,18 +1037,18 @@ fn run_optimize(cfg: &Config, use_amhb: bool, use_keysoul: bool, cli_config_path
         optimizer.solve(&ctx, param, next_temp, &stop_flag);
 
         // 从 optimizer 获取最佳结果
-        let amhb_result = vec![(optimizer.best_assignment.clone(), optimizer.best_score, types::Metrics::default(), SimpleMetrics::default())];
+        let amhb_result = vec![(optimizer.best_assignment.clone(), optimizer.best_score, types::Metrics::default(), SimpleMetrics::default(), WordMetrics::default())];
 
         // 若被中断，直接输出当前最优并退出（AMHB 暂不支持断点续算）
         if stop_flag.load(Ordering::Relaxed) {
             let eval = Evaluator::new(&ctx, &optimizer.best_assignment);
             let m = eval.get_metrics(&ctx);
             let sm = eval.get_simple_metrics(&ctx);
+            let wm = eval.get_word_metrics(&ctx);
             println!("\n⏸️  优化已暂停（AMHB 模式不支持断点续算）");
             println!("   当前最优得分: {:.4}", optimizer.best_score);
             println!("   重码数: {}", m.collision_count);
-            // 仍然保存当前最优结果
-            let all_results = vec![(0usize, optimizer.best_assignment.clone(), optimizer.best_score, m, sm)];
+            let all_results = vec![(0usize, optimizer.best_assignment.clone(), optimizer.best_score, m, sm, wm)];
             let output_dir_ref = &output_dir;
             let root_usage_ref = &root_usage;
             save_results(&ctx, &optimizer.best_assignment, optimizer.best_score, &m, &sm, output_dir_ref, root_usage_ref);
@@ -1081,61 +1119,61 @@ fn run_optimize(cfg: &Config, use_amhb: bool, use_keysoul: bool, cli_config_path
 
         sa_results
             .into_iter()
-            .map(|r| (r.assignment, r.score, r.metrics, r.simple_metrics))
+            .map(|r| (r.assignment, r.score, r.metrics, r.simple_metrics, r.word_metrics))
             .collect()
     };
 
     // SA 模式需要额外处理结果
-    let all_results: Vec<(usize, Vec<u8>, f64, types::Metrics, SimpleMetrics)> = if use_amhb {
-        // AMHB 只有一个结果（但我们有多线程的 assignment，取最优）
+    let all_results: Vec<(usize, Vec<u8>, f64, types::Metrics, SimpleMetrics, WordMetrics)> = if use_amhb {
         let best = results.into_iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap();
-        vec![(0, best.0, best.1, best.2, best.3)]
+        vec![(0, best.0, best.1, best.2, best.3, best.4)]
     } else {
-        // SA 结果处理
         results
             .into_iter()
             .enumerate()
-            .map(|(i, (a, s, m, sm))| (i, a, s, m, sm))
+            .map(|(i, (a, s, m, sm, wm))| (i, a, s, m, sm, wm))
             .collect()
     };
 
-    // 找出最优结果
-    let (best_thread, best_assignment, best_score, best_metrics, best_simple_metrics) = all_results
+    let (best_thread, best_assignment, best_score, best_metrics, best_simple_metrics, best_word_metrics) = all_results
         .iter()
         .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap())
-        .map(|(tid, a, s, m, sm)| (*tid, a.clone(), *s, *m, *sm))
+        .map(|(tid, a, s, m, sm, wm)| (*tid, a.clone(), *s, *m, *sm, *wm))
         .unwrap();
 
     let elapsed = start_time.elapsed();
 
-    // 打印最优结果
     let m = best_metrics;
     let sm = best_simple_metrics;
+    let wm = best_word_metrics;
     println!("\n=================================");
     println!("🏆 最优结果 (线程 {}):", best_thread);
     println!("   综合得分: {:.4}", best_score);
+    println!("   「全码」前{}重码数: {}", ctx.weights.full_top_n, m.top_n_collision_count);
     println!("   「全码」重码数: {}", m.collision_count);
     println!("   「全码」重码率: {:.6}%", m.collision_rate * 100.0);
     println!("   「全码」加权键均当量: {:.4}", m.equiv_mean);
-    println!("   「全码」当量变异系数(CV): {:.4}", m.equiv_cv);
     println!("   「全码」用指分布偏差(L2): {:.4}", m.dist_deviation);
-    if cfg.weights.simple_code.enabled {
+    if ctx.enable_simple_code {
         println!("---------------------------------");
         println!("   「简码」重码数: {}", sm.collision_count);
         println!("   「简码」重码率: {:.6}%", sm.collision_rate * 100.0);
-        println!(
-            "   「简码」覆盖率: {:.4}%",
-            sm.weighted_freq_coverage * 100.0
-        );
+        println!("   「简码」加权码长: {:.4}", sm.weighted_key_length);
         println!("   「简码」加权当量: {:.4}", sm.equiv_mean);
         println!("   「简码」分布偏差: {:.4}", sm.dist_deviation);
+    }
+    if ctx.enable_word_code {
+        println!("---------------------------------");
+        println!("   「词码」前2000重码数: {}", wm.top2000_collision_count);
+        println!("   「词码」前10000重码数: {}", wm.top10000_collision_count);
+        println!("   「词码」总重码数: {}", wm.collision_count);
+        println!("   「词码」重码率: {:.6}%", wm.collision_rate * 100.0);
     }
     println!("⏱️ 总耗时: {:?}", elapsed);
     println!("=================================");
 
-    // ==================== 保存结果 ====================
     println!("\n📁 保存所有线程结果...");
-    for (tid, assignment, score, metrics, smetrics) in &all_results {
+    for (tid, assignment, score, metrics, smetrics, _) in &all_results {
         save_thread_results(
             &ctx,
             assignment,
@@ -1238,6 +1276,7 @@ fn run_resume(cfg: &Config, checkpoint_path: &str) {
         simple_config,
         weights,
         ckpt.use_keysoul,
+        vec![],
     );
 
     println!("\n  数据加载完毕:");
@@ -1354,16 +1393,16 @@ fn run_resume(cfg: &Config, checkpoint_path: &str) {
     }
 
     // 正常完成 — 输出结果
-    let all_results: Vec<(usize, Vec<u8>, f64, types::Metrics, SimpleMetrics)> = sa_results
+    let all_results: Vec<(usize, Vec<u8>, f64, types::Metrics, SimpleMetrics, WordMetrics)> = sa_results
         .into_iter()
         .enumerate()
-        .map(|(i, r)| (i, r.assignment, r.score, r.metrics, r.simple_metrics))
+        .map(|(i, r)| (i, r.assignment, r.score, r.metrics, r.simple_metrics, r.word_metrics))
         .collect();
 
-    let (best_thread, best_assignment, best_score, best_metrics, best_simple_metrics) = all_results
+    let (best_thread, best_assignment, best_score, best_metrics, best_simple_metrics, _best_word_metrics) = all_results
         .iter()
         .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap())
-        .map(|(tid, a, s, m, sm)| (*tid, a.clone(), *s, *m, *sm))
+        .map(|(tid, a, s, m, sm, wm)| (*tid, a.clone(), *s, *m, *sm, *wm))
         .unwrap();
 
     let elapsed = start_time.elapsed();
@@ -1373,28 +1412,24 @@ fn run_resume(cfg: &Config, checkpoint_path: &str) {
     println!("\n=================================");
     println!("🏆 最优结果 (线程 {}):", best_thread);
     println!("   综合得分: {:.4}", best_score);
+    println!("   「全码」前{}重码数: {}", ctx.weights.full_top_n, m.top_n_collision_count);
     println!("   「全码」重码数: {}", m.collision_count);
     println!("   「全码」重码率: {:.6}%", m.collision_rate * 100.0);
     println!("   「全码」加权键均当量: {:.4}", m.equiv_mean);
-    println!("   「全码」当量变异系数(CV): {:.4}", m.equiv_cv);
     println!("   「全码」用指分布偏差(L2): {:.4}", m.dist_deviation);
-    if cfg.weights.simple_code.enabled {
+    if ctx.enable_simple_code {
         println!("---------------------------------");
         println!("   「简码」重码数: {}", sm.collision_count);
         println!("   「简码」重码率: {:.6}%", sm.collision_rate * 100.0);
-        println!(
-            "   「简码」覆盖率: {:.4}%",
-            sm.weighted_freq_coverage * 100.0
-        );
+        println!("   「简码」加权码长: {:.4}", sm.weighted_key_length);
         println!("   「简码」加权当量: {:.4}", sm.equiv_mean);
         println!("   「简码」分布偏差: {:.4}", sm.dist_deviation);
     }
     println!("⏱️ 总耗时: {:?}", elapsed);
     println!("=================================");
 
-    // 保存结果
     println!("\n📁 保存所有线程结果...");
-    for (tid, assignment, score, metrics, smetrics) in &all_results {
+    for (tid, assignment, score, metrics, smetrics, _) in &all_results {
         save_thread_results(
             &ctx,
             assignment,
