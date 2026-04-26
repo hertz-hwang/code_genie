@@ -208,8 +208,11 @@ pub fn load_keymap(keymap_path: &str, division_path: &str) -> HashMap<String, u8
         }
     }
 
-    // 对每个基础字根的后缀列表排序
+    // 确保每个基础字根的后缀列表包含 -1（即 keymap 中的无后缀条目对应第1码）
     for suffixes in base_to_suffixes.values_mut() {
+        if !suffixes.contains(&-1) {
+            suffixes.push(-1);
+        }
         suffixes.sort();
     }
 
