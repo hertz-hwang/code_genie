@@ -825,11 +825,34 @@ fn build_logical_roots_for_encode(
             });
         } else {
             let mut attached = false;
+            // 优先：找同名基础根
             for lr in logical_roots.iter_mut().rev() {
                 if lr.base_name == base {
                     lr.split_part_indices.push(idx);
                     attached = true;
                     break;
+                }
+            }
+            // 次选：找同组基础根（第一个键相同视为同组）
+            // 找到后用 base 的完整键序列替换 full_code_parts，确保取到正确子根的键
+            if !attached {
+                let base_first_key = keymap_sequences
+                    .get(&base)
+                    .and_then(|s| s.first().copied())
+                    .or_else(|| root_to_key.get(&base).copied());
+                if let Some(bfk) = base_first_key {
+                    let new_parts = full_code_parts_for(&base);
+                    for lr in logical_roots.iter_mut().rev() {
+                        let lr_first_key = lr.full_code_parts.first().copied().map(|k| k as u8);
+                        if lr_first_key == Some(bfk) {
+                            lr.split_part_indices.push(idx);
+                            if !new_parts.is_empty() {
+                                lr.full_code_parts = new_parts;
+                            }
+                            attached = true;
+                            break;
+                        }
+                    }
                 }
             }
             if !attached {

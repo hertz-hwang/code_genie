@@ -548,11 +548,46 @@ pub fn extract_logical_roots_full(
             });
         } else {
             let mut attached = false;
+            // 优先：找同名基础根
             for lr in logical_roots.iter_mut().rev() {
                 if lr.base_name == base {
                     lr.split_part_indices.push(idx);
                     attached = true;
                     break;
+                }
+            }
+            // 次选：找同组基础根（如 "无" 与 "元" 同组，则 "元.1" 附加到 "无" 的逻辑根上）
+            // 找到后用 base（"元"）的完整编码序列替换 full_code_parts，确保取到正确子根的键
+            if !attached {
+                if let Some(&base_group) = root_to_group.get(&base) {
+                    let new_full_names = root_full_codes
+                        .get(&base)
+                        .cloned()
+                        .unwrap_or_else(|| vec![base.clone()]);
+                    let new_parts: Vec<u16> = new_full_names
+                        .iter()
+                        .map(|n| {
+                            if let Some(&key) = fixed_roots.get(n) {
+                                key as u16
+                            } else if let Some(&gi) = root_to_group.get(n) {
+                                gi as u16 + GROUP_MARKER
+                            } else {
+                                0u16
+                            }
+                        })
+                        .collect();
+                    for lr in logical_roots.iter_mut().rev() {
+                        if let Some(&lr_group) = root_to_group.get(&lr.base_name) {
+                            if lr_group == base_group {
+                                lr.split_part_indices.push(idx);
+                                if !new_parts.is_empty() {
+                                    lr.full_code_parts = new_parts;
+                                }
+                                attached = true;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             if !attached {
