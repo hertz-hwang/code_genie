@@ -650,6 +650,7 @@ pub fn build_simple_prefix_for_encode(
     root_to_key: &HashMap<String, u8>,
     splits: &[(char, Vec<String>, u64)],
     simple_config: &SimpleCodeConfig,
+    keymap_sequences: &HashMap<String, Vec<u8>>,
 ) -> (String, usize) {
     if simple_config.levels.is_empty() {
         return (String::new(), 0);
@@ -689,10 +690,10 @@ pub fn build_simple_prefix_for_encode(
     }
 
     // 为每个字构建逻辑根列表（用于简码规则解析）
-    // 逻辑根：按 extract_base_name 分组，同名多变体合并
+    // full_code_parts 直接取 keymap_sequences 里该字根的完整键序列
     let char_logical_roots: Vec<Vec<LogicalRoot>> = splits
         .iter()
-        .map(|(_, roots, _)| build_logical_roots_for_encode(roots, root_to_key))
+        .map(|(_, roots, _)| build_logical_roots_for_encode(roots, root_to_key, keymap_sequences))
         .collect();
 
     let mut out = String::new();
@@ -792,47 +793,47 @@ fn is_full_code_occupied(
 
 /// 为 encode 子命令构建逻辑根列表
 ///
-/// 根据根名列表和 root_to_key 映射，按 extract_base_name 分组，
-/// 构建 LogicalRoot 列表（full_code_parts 为键位索引序列）。
+/// full_code_parts 直接取 keymap_sequences 里该字根的完整键序列，
+/// 使 Ab/Zb 等多码位规则能正确取到第 2、3 个键位。
 fn build_logical_roots_for_encode(
     roots: &[String],
     root_to_key: &HashMap<String, u8>,
+    keymap_sequences: &HashMap<String, Vec<u8>>,
 ) -> Vec<LogicalRoot> {
     let mut logical_roots: Vec<LogicalRoot> = Vec::new();
+
+    let full_code_parts_for = |base_name: &str| -> Vec<u16> {
+        if let Some(seq) = keymap_sequences.get(base_name) {
+            seq.iter().map(|&k| k as u16).collect()
+        } else if let Some(&k) = root_to_key.get(base_name) {
+            vec![k as u16]
+        } else {
+            vec![]
+        }
+    };
 
     for (idx, name) in roots.iter().enumerate() {
         let base = extract_base_name(name);
         let suffix = extract_suffix_num(name);
 
         if suffix <= 0 {
-            // 新逻辑根：收集同 base 的所有变体键位
-            // 在 encode 场景下，root_to_key 是扁平的，每个根名对应一个键位
-            // 逻辑根的 full_code_parts 就是该根名对应的键位（单元素）
-            let key = root_to_key.get(name).copied();
-            let full_code_parts: Vec<u16> = key.map(|k| vec![k as u16]).unwrap_or_default();
-
+            let full_code_parts = full_code_parts_for(&base);
             logical_roots.push(LogicalRoot {
                 base_name: base,
                 split_part_indices: vec![idx],
                 full_code_parts,
             });
         } else {
-            // 带数字后缀：附加到同名逻辑根
             let mut attached = false;
             for lr in logical_roots.iter_mut().rev() {
                 if lr.base_name == base {
                     lr.split_part_indices.push(idx);
-                    // 追加该变体的键位
-                    if let Some(&key) = root_to_key.get(name) {
-                        lr.full_code_parts.push(key as u16);
-                    }
                     attached = true;
                     break;
                 }
             }
             if !attached {
-                let key = root_to_key.get(name).copied();
-                let full_code_parts: Vec<u16> = key.map(|k| vec![k as u16]).unwrap_or_default();
+                let full_code_parts = full_code_parts_for(&base);
                 logical_roots.push(LogicalRoot {
                     base_name: base,
                     split_part_indices: vec![idx],

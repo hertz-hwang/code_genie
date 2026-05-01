@@ -270,6 +270,33 @@ pub fn load_keymap(keymap_path: &str, division_path: &str) -> HashMap<String, u8
     root_to_key
 }
 
+/// 加载 keymap 文件，返回每个字根的完整键序列（不做 suffix 展开）
+/// 用于 encode 模式下构建逻辑根的 full_code_parts
+pub fn load_keymap_sequences(keymap_path: &str) -> HashMap<String, Vec<u8>> {
+    let content = fs::read_to_string(keymap_path).expect("无法读取 keymap 文件");
+    let mut result: HashMap<String, Vec<u8>> = HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let base_name = parts[0].trim().to_string();
+        let encoding = parts[1].trim().to_lowercase();
+        let keys: Vec<u8> = encoding
+            .chars()
+            .filter_map(|c| char_to_key_index(c).map(|i| i as u8))
+            .collect();
+        if !keys.is_empty() {
+            result.insert(base_name, keys);
+        }
+    }
+    result
+}
+
 /// 加载键位分布配置
 /// 
 /// # 返回值

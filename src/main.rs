@@ -200,6 +200,7 @@ fn run_encode(division_path: &str, keymap_path: &str, output_path: &str, cfg: Op
 
     // 加载数据
     let root_to_key = loader::load_keymap(keymap_path, division_path);
+    let keymap_sequences = loader::load_keymap_sequences(keymap_path);
     let splits = loader::load_splits(division_path);
 
     println!("  已加载 {} 个字根映射", root_to_key.len());
@@ -211,7 +212,7 @@ fn run_encode(division_path: &str, keymap_path: &str, output_path: &str, cfg: Op
         let simple_config = c.get_simple_code_config();
         if !simple_config.levels.is_empty() {
             println!("  简码级别: {} 级", simple_config.levels.len());
-            let (prefix, count) = output::build_simple_prefix_for_encode(&root_to_key, &splits, &simple_config);
+            let (prefix, count) = output::build_simple_prefix_for_encode(&root_to_key, &splits, &simple_config, &keymap_sequences);
             simple_count = count;
             prefix
         } else {
