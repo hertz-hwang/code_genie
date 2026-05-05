@@ -1132,8 +1132,8 @@ pub fn simulated_annealing_resumable(
             let elapsed = sa_start.elapsed().as_secs_f64();
             let speed = if elapsed > 0.0 { step as f64 / elapsed } else { 0.0 };
             println!(
-                "   [T0] 进度: {}% | {:.1} 万步/分钟 | 基温: {:.6} | 重码={} 当量={:.4} | 当前: {:.4} 🏆最优: {:.4}",
-                pct, speed * 60.0 / 10000.0, base_temp, m.collision_count, m.equiv_mean,
+                "   [T0] 进度: {}% | {:.1} 万步/分钟 | 基温: {:.6} | 重码={} 重码率={:.4}% 当量={:.4} | 当前: {:.4} 🏆最优: {:.4}",
+                pct, speed * 60.0 / 10000.0, base_temp, m.collision_count, m.collision_rate * 100.0, m.equiv_mean,
                 evaluator.get_score(ctx), best_score
             );
         }
