@@ -368,6 +368,14 @@ impl AmhbOptimizer {
                         );
                     }
                     println!();
+
+                    for wid in 0..self.num_workers {
+                        let eval = unsafe { &*evaluators_ptr.ptr().add(wid) };
+                        println!("  [Worker {wid} | {:?}", eval.get_metrics(ctx_ref));
+                        println!("            | {:?}", eval.get_simple_metrics(ctx_ref));
+                        println!("            | {:?}]", eval.get_word_metrics(ctx_ref));
+                    }
+                    println!();
                 }
 
                 // 8. 降温

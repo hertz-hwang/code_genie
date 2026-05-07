@@ -261,7 +261,7 @@ pub struct RootGroup {
 }
 
 /// 单字全码评估指标
-#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize)]
 pub struct Metrics {
     /// 字频前 N 重码数
     pub top_n_collision_count: usize,
@@ -276,7 +276,7 @@ pub struct Metrics {
 }
 
 /// 单字简码评估指标
-#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize)]
 pub struct SimpleMetrics {
     /// 全字符加权平均码长（出简字取简码长，否则取全码长）
     pub weighted_key_length: f64,
@@ -291,7 +291,7 @@ pub struct SimpleMetrics {
 }
 
 /// 多字词全码评估指标
-#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize)]
 pub struct WordMetrics {
     /// 词频前 2000 重码数
     pub top2000_collision_count: usize,
