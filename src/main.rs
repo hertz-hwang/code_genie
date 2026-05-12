@@ -212,7 +212,9 @@ fn run_encode(division_path: &str, keymap_path: &str, output_path: &str, cfg: Op
         let simple_config = c.get_simple_code_config();
         if !simple_config.levels.is_empty() {
             println!("  简码级别: {} 级", simple_config.levels.len());
-            let (prefix, count) = output::build_simple_prefix_for_encode(&root_to_key, &splits, &simple_config, &keymap_sequences);
+            let forbidden_chars: std::collections::HashSet<char> =
+                c.simple_forbidden_chars.chars().collect();
+            let (prefix, count) = output::build_simple_prefix_for_encode(&root_to_key, &splits, &simple_config, &keymap_sequences, &forbidden_chars);
             simple_count = count;
             prefix
         } else {

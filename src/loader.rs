@@ -208,11 +208,9 @@ pub fn load_keymap(keymap_path: &str, division_path: &str) -> HashMap<String, u8
         }
     }
 
-    // 确保每个基础字根的后缀列表包含 -1（即 keymap 中的无后缀条目对应第1码）
+    // 对后缀列表排序；不强行插入 -1，因为 division 可能只使用 .0/.1/.2 形式
+    // 若裸字根（无后缀）本身出现在 division 中，extract_suffix_num 已返回 -1，无需额外处理
     for suffixes in base_to_suffixes.values_mut() {
-        if !suffixes.contains(&-1) {
-            suffixes.push(-1);
-        }
         suffixes.sort();
     }
 

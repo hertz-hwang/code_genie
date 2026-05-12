@@ -165,6 +165,9 @@ pub fn save_combined_code_output(ctx: &OptContext, assignment: &[u8], dir: &str)
             if simple_assigned.contains(&ci) {
                 continue;
             }
+            if !ctx.simple_forbidden.is_empty() && ctx.simple_forbidden[ci] {
+                continue;
+            }
             if allowed_len != 0 && ctx.char_infos[ci].parts_len as usize != allowed_len {
                 continue;
             }
@@ -299,6 +302,9 @@ pub fn save_simple_code_output(ctx: &OptContext, assignment: &[u8], dir: &str) {
 
         for &ci in &sorted_chars {
             if globally_assigned.contains(&ci) {
+                continue;
+            }
+            if !ctx.simple_forbidden.is_empty() && ctx.simple_forbidden[ci] {
                 continue;
             }
             if allowed_len != 0 && ctx.char_infos[ci].parts_len as usize != allowed_len {
@@ -683,6 +689,7 @@ pub fn build_simple_prefix_for_encode(
     splits: &[(char, Vec<String>, u64)],
     simple_config: &SimpleCodeConfig,
     keymap_sequences: &HashMap<String, Vec<u8>>,
+    forbidden_chars: &std::collections::HashSet<char>,
 ) -> (String, usize) {
     if simple_config.levels.is_empty() {
         return (String::new(), 0);
@@ -739,6 +746,9 @@ pub fn build_simple_prefix_for_encode(
 
         for &ci in &sorted_indices {
             if globally_assigned.contains(&ci) {
+                continue;
+            }
+            if !forbidden_chars.is_empty() && forbidden_chars.contains(&splits[ci].0) {
                 continue;
             }
             // allowed_orig_length 约束：0 = 不限制

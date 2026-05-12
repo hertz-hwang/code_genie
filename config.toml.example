@@ -1,11 +1,11 @@
 # =========================================================================
 # 🔧 CodeGenie 配置文件
 # =========================================================================
-# 使用方法：将本文件复制为 config.toml，按需修改后运行优化。
-# 运行命令：
-#    cp config.toml.example config.toml
-#    cargo build --release
-#    ./target/release/code_genie optimize
+
+# 禁止出简码的字集（字符串，每个字符均不参与简码分配；空字符串或不填表示不限制）
+# ⚠️  此字段必须放在任何 [section] 之前，否则 TOML 会将其归入上方的 section 而被忽略
+# 示例：simple_forbidden_chars = "的了是在"
+simple_forbidden_chars = ""
 
 # -------------------------------------------------------------------------
 # 📂 文件路径配置
@@ -39,173 +39,94 @@ key_dist = "key_distribution.txt"
 # -------------------------------------------------------------------------
 # 顶层权重：三组目标的相对重要性（建议总和为 1.0）
 [weights]
-full = 0.4       # 单字全码权重
-simple = 0.5     # 单字简码权重
-word = 0.1       # 多字词全码权重（需同时启用 word_code.enabled）
+full = 0.5       # 单字全码权重
+simple = 0.3     # 单字简码权重
+word = 0.2       # 多字词全码权重（需同时启用 word_code.enabled）
 
 # 单字全码子权重（calibrate_scales 已将各指标归一化到初始值≈1.0，子权重直接表达各指标的相对重要性，无需归一化）
 [weights.full_code]
 top_n = 1500                  # 字频前 N 重码数的 N 值
-top_n_collision_count = 5.0   # 前 N 重码数权重
-collision_count = 10.0         # 总重码数权重
-collision_rate = 15.0          # 重码率权重
-equivalence = 10.0             # 当量权重
-distribution = 5.0            # 键位分布偏差权重
+top_n_collision_count = 1.0   # 前 N 重码数权重
+collision_count = 1.0         # 总重码数权重
+collision_rate = 1.0          # 重码率权重
+equivalence = 1.0             # 当量权重
+distribution = 1.0            # 键位分布偏差权重
 
 # 单字简码子权重（同上，无需归一化）
 [weights.simple_code]
 enabled = true
-weighted_key_length = 20.0     # 加权码长权重（全字符加权平均码长）
-collision_count = 15.0         # 重码数权重
-collision_rate = 20.0          # 重码率权重
-equivalence = 30.0             # 当量权重
-distribution = 5.0            # 键位分布偏差权重
+weighted_key_length = 1.0     # 加权码长权重（全字符加权平均码长）
+collision_count = 1.0         # 重码数权重
+collision_rate = 1.0          # 重码率权重
+equivalence = 1.0             # 当量权重
+distribution = 1.0            # 键位分布偏差权重
 
 # 多字词全码子权重（同上，无需归一化）
 [weights.word_code]
 enabled = true                  # 是否启用词码优化
-top2000_collision_count = 0.0   # 词频前 2000 重码数权重
-top10000_collision_count = 0.0  # 词频前 10000 重码数权重
-collision_count = 0.0           # 总重码数权重
-collision_rate = 100.0            # 重码率权重
-equivalence = 10.0               # 当量权重
-distribution = 0.0              # 键位分布偏差权重
+top2000_collision_count = 1.0   # 词频前 2000 重码数权重
+top10000_collision_count = 1.0  # 词频前 10000 重码数权重
+collision_count = 1.0           # 总重码数权重
+collision_rate = 1.0            # 重码率权重
+equivalence = 1.0               # 当量权重
+distribution = 1.0              # 键位分布偏差权重
 
-# -------------------------------------------------------------------------
-# 🎰 AMHB 算法参数（仅 --amhb 模式使用）
-# -------------------------------------------------------------------------
-# AMHB（Adaptive Multi-candidate Heat Bath）是模拟退火的替代算法。
-# 核心思想：用 EXP3 多臂老虎机自适应选择算子，温度固定（Heat Bath 准则），
-# 不使用退火调度。适合探索性更强的搜索场景。
 [amhb]
-# EXP3 算子池大小：同时维护的候选邻居解数量。
-#   值越大，每步探索范围越广，但内存和计算开销也越大。
-total_neighbors = 240
-
-# 工作窃取阈值：当某线程的任务队列剩余量低于此值时，
-#   允许从其他线程"窃取"任务，提高多线程负载均衡效率。
-steal_threshold = 1
-
-# 最大迭代步数：AMHB 算法的总运行步数上限，达到后强制停止。
-total_steps = 1000000000
-
-# AMHB 初始温度：Heat Bath 接受准则中的温度参数。
-#   温度越高，接受劣解的概率越大（探索性越强）；
-temp_start = 40.0
+total_neighbors = 240      # EXP3 算子池大小（总邻居数）
+steal_threshold = 0        # 工作窃取阈值
+total_steps = 1000000000     # 最大迭代步数
+temp_start = 40.0          # AMHB 初始温度
 
 # 分段降温参数（piecewise exponential cooling）
 # 每段定义 threshold 和 factor：当 temp > threshold 时，每步 temp *= factor
 # 按 threshold 从高到低排列，第一个满足的段生效
 # 若温度低于所有阈值，优化终止
 [[amhb.cooling_segments]]
-# 高温区（temp > 7.5）：快速降温，快速跳出初始随机状态
-threshold = 7.5
+threshold = 7.5            # 高温区
 factor = 0.99999
 
 [[amhb.cooling_segments]]
-# 中高温区（1.75 < temp ≤ 7.5）：适中降温，平衡探索与利用
-threshold = 1.75
+threshold = 1.75           # 中高温区
 factor = 0.999999
 
 [[amhb.cooling_segments]]
-# 中低温区（1.25 < temp ≤ 1.75）：缓慢降温，精细搜索
-threshold = 1.25
+threshold = 1.25           # 中低温区
 factor = 0.9999995
 
 [[amhb.cooling_segments]]
-# 低温区（0.002 < temp ≤ 1.25）：极缓慢降温，收敛到局部最优
-#   当 temp ≤ 0.002 时，所有段均不满足，算法终止
-threshold = 0.002
+threshold = 0.15           # 低温区
 factor = 0.9999999625
 
 # -------------------------------------------------------------------------
-# 🌡️ 模拟退火参数（默认优化模式使用）
+# 🌡️ 模拟退火参数
 # -------------------------------------------------------------------------
 [annealing]
-# 并行线程数：同时运行的独立 SA 实例数量。
-#   每个线程从不同初始解出发，最终取所有线程中的最优结果。
-#   建议设为 CPU 核心数，过多会因上下文切换降低效率。
-threads = 8
-
-# 总迭代步数：每个线程执行的 SA 步数上限。
-#   步数越多，优化质量越高，但耗时也越长。
-#   实际运行时间 ≈ total_steps / (速度 万步/分钟)。
-total_steps = 2000000
-
-# 初始温度：SA 开始时的温度，决定初期接受劣解的概率。
-#   温度越高，初期探索范围越广；过高会导致随机游走，过低会过早收敛。
-temp_start = 0              # 初始温度 (0=自动校准，推荐)
-
-# 结束温度：SA 终止的温度阈值，低于此值时停止。
-#   通常设为极小值，确保算法在 total_steps 内自然结束。
-temp_end = 0.000001
-
-# 舒适温度（高斯中心）：降温曲线在此温度附近会自动减速。
-#   模拟"舒适区"效应：在最有可能找到好解的温度范围内多花时间。
-#   通常设为略高于最终收敛温度的值。
-comfort_temp = 0.4
-
-# 舒适区宽度（高斯 sigma）：舒适区的温度范围半径。
-#   值越大，减速效果覆盖的温度范围越宽；值越小，减速越集中。
-comfort_width = 0.15
-
-# 舒适区减速因子（0~1）：在舒适区内降温速率乘以此因子。
-#   0.7 表示降温速度降至正常的 70%，即在舒适区多停留约 43% 的时间。
-#   设为 1.0 可禁用舒适区减速。
-comfort_slowdown = 0.7
-
-# 交换操作概率（0~1）：每步选择 swap（交换两组键位）的概率。
-#   剩余概率 (1 - swap_probability) 执行 move（将一组移到新键位）。
-#   swap 保持键位集合不变，适合精细调整；move 改变键位集合，探索性更强。
-#   此概率会随迭代进度线性增长，后期更多使用 swap。
-swap_probability = 0.35
+threads = 12             # 并行线程数
+total_steps = 2000000     # 单线程迭代步数
+temp_start = 100.0         # 初始温度 (0=自动校准，推荐)
+temp_end = 0.000001      # 结束温度
+comfort_temp = 0.4       # 舒适温度区间
+comfort_width = 0.15     # 舒适区宽度
+comfort_slowdown = 0.7   # 舒适区减速因子
+swap_probability = 0.35   # 交换操作概率
 
 # 以下参数基于 total_steps 的比例计算
-# 最小改进步数比例：连续经过 (total_steps * ratio) 步无改进时触发重热。
-#   0.1 表示连续 20 万步（200000 步）无改进则重热。
-#   设为较大值可减少重热频率，让 SA 在当前区域充分搜索。
-min_improve_steps_ratio = 0.1
-
-# 扰动间隔比例：每隔 (total_steps * ratio) 步执行一次低温扰动。
-#   设为 0 可完全关闭扰动机制（推荐：扰动效果因问题而异）。
-perturb_interval_ratio = 0.0
-
-# 扰动强度：扰动时随机移动的字根组数量比例。
-#   0 表示不扰动；较大值会大幅改变当前解，有助于跳出深层局部最优。
-perturb_strength = 0.0
-
-# 扰动触发温度比例：当 base_temp < comfort_temp * ratio 时才允许扰动。
-#   确保扰动只在低温（接近收敛）时发生，避免高温期无效扰动。
-perturb_trigger_temp_ratio = 0.01
-
-# 扰动时温度倍率：扰动发生时将当前温度乘以此值，临时升温以接受扰动后的解。
-#   2.0 表示扰动后温度翻倍，增加接受新解的概率。
-perturb_temp_multiplier = 2.0
-
-# 扰动时优先采样的冲突对上限：扰动时优先选择参与重码的字根组进行移动。
-#   10 表示最多从 10 个冲突对中采样，聚焦于解决当前重码问题。
-perturb_collision_pairs_limit = 10
-
-# 重热倍率：触发重热时将当前温度乘以此值。
-#   1.0 表示不重热（禁用重热机制）；
-#   大于 1.0（如 1.5）表示重热时温度升高 50%，帮助跳出局部最优。
-reheat_factor = 1.0
-
-# 最大码长：汉字编码的最大字根数（即最多取几个字根的键位组成编码）。
-#   3 表示最多取前 3 个字根，超出部分忽略。
-#   应与输入法方案的码长设计一致。
-max_parts = 3
+min_improve_steps_ratio = 0.1    # 最小改进步数比例 (total_steps / 10)
+perturb_interval_ratio = 0.0    # 设为 0 可关闭低温扰动
+perturb_strength = 0.0          # 扰动强度
+perturb_trigger_temp_ratio = 0.01 # 扰动触发温度比例 (base_temp < comfort_temp * ratio)
+perturb_temp_multiplier = 2.0     # 扰动时温度倍率 (temp * multiplier)
+perturb_collision_pairs_limit = 10 # 扰动时优先采样的冲突对上限
+reheat_factor = 1.0             # 设为 1.0 可关闭重新加热
+max_parts = 3                    # 最大码长
 
 # -------------------------------------------------------------------------
 # ⌨️ 键位配置
 # -------------------------------------------------------------------------
 [keys]
-# 允许的键位字符：动态字根可以分配到的键位集合。
-#   通常为 26 个英文字母；可以去掉某些键（如 z）来保留特殊用途。
+# 允许的键位字符（用于动态字根分配）
 allowed = "qwertyuiopasdfghjklzxcvbnm"
-
-# 键位显示顺序：输出报告（键位分布统计）中键位的排列顺序。
-#   按此顺序显示每个键的使用率，方便对照键盘布局阅读。
+# 键位显示顺序（用于输出报告）
 display_order = "qwertyuiopasdfghjklzxcvbnm"
 
 # -------------------------------------------------------------------------
@@ -216,9 +137,9 @@ display_order = "qwertyuiopasdfghjklzxcvbnm"
 #   根选择: A=第1根, B=第2根, C=第3根, ... Z=最后一根
 #   码位选择: a=第1码, b=第2码, c=第3码, ... z=最后一码
 #
-# 示例: 全码为4码定长方案，拆分 "在 𠂇 2 土 土.1"
-#   逻辑根: [𠂇(码=[𠂇]), 2(码=[2]), 土(码=[土,土.1])]
-#   Aa = 𠂇的第1码
+# 示例: 拆分 "在 𠂇 𠂇.1 2 土 土.1"
+#   逻辑根: [𠂇(码=[𠂇,𠂇.1]), 2(码=[2]), 土(码=[土,土.1])]
+#   Aa = 𠂇的第1码, Ab = 𠂇的第2码
 #   Ba = 2的第1码
 #   Ca = 土的第1码, Cz = 土的最后一码
 #   Za = 最后一根(土)的第1码, Zz = 最后一根(土)的最后一码
@@ -229,9 +150,9 @@ display_order = "qwertyuiopasdfghjklzxcvbnm"
 #     若设为正整数 N，则只分配频率最高的 N 个汉字
 #   rules=["Aa"] 表示取第1逻辑根的第1个码位作为简码
 [[simple_levels]]
-level = 1
-code_num = 1
-rules = ["Aa"]
+level = 1                # 简码级数
+code_num = 1             # 简码个数
+rules = ["Aa"]           # 简码规则
 allowed_orig_length = 0  # 0 = 不限制；设为正整数则只允许该码长的全码出简码
 yield_full_code = true   # 出简让全：true = 已出简的字让出其全码码位，允许其他字出简到该位置
 
